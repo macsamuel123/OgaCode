@@ -1,0 +1,47 @@
+{
+  "name": "ogacode",
+  "displayName": "OgaCode",
+  "description": "AI coding assistant for Nigerian developers — optimized for 3G and 8GB RAM",
+  "version": "0.0.1",
+  "publisher": "ogacode",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onLanguage:typescript",
+    "onLanguage:javascript",
+    "onLanguage:python"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ogacode-sidebar",
+          "title": "OgaCode",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ogacode-sidebar": [
+        {
+          "type": "webview",
+          "id": "ogacode.sidebar",
+          "name": "OgaCode Assistant"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.cjs",
+    "build:prod": "node esbuild.cjs --production",
+    "watch": "node esbuild.cjs --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  }
+}

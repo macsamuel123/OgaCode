@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ogacode"
+version = "0.1.0"
+description = "Agentic AI coding assistant — optimised for constrained hardware and expensive mobile data"
+requires-python = ">=3.10"
+dependencies = [
+    # click — CLI framework, 240KB wheel
+    "click>=8.1",
+    # rich — terminal UI: spinners, panels, syntax highlighting
+    "rich>=13.0",
+    # httpx — async HTTP with streaming + gzip (245KB wheel)
+    "httpx>=0.27.0",
+    # tiktoken — token counting for context pruning
+    "tiktoken>=0.7",
+    # diskcache — SQLite-backed cache with LRU eviction (120KB wheel)
+    "diskcache>=5.6",
+    # keyring — OS keychain: macOS Keychain, Windows Credential Manager, libsecret
+    "keyring>=24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    # pytest — test runner
+    "pytest>=8.0",
+    # pytest-asyncio — async test support (agent_loop is async)
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "slow: hits a real LLM (needs API keys)",
+]
+
+[project.scripts]
+ogacode = "ogacode.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ogacode"]
