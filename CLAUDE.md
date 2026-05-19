@@ -281,3 +281,4 @@ ogacode stats --reset && # run 10 tasks && ogacode stats --json
 **"Make it work offline, make it fast online, make it cheap always."**
 
 Nigerian students don't have unlimited data or stable power. OgaCode must be the most respectful tool they use — respectful of their time, their money, and their reality.
+acodfe

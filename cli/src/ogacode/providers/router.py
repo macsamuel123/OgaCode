@@ -13,14 +13,14 @@ _PROVIDERS = [
         "base_url": "https://api.deepseek.com/v1",
         "model": "deepseek-chat",
         "key_name": "deepseek_api_key",
-        "timeout": 15,
+        "timeout": 60,
     },
     {
         "name": "groq",
         "base_url": "https://api.groq.com/openai/v1",
         "model": "qwen/qwen3-32b",
         "key_name": "groq_api_key",
-        "timeout": 10,
+        "timeout": 30,
     },
     {
         "name": "ollama",
@@ -84,10 +84,9 @@ async def call_llm(
             last_err = exc
             await _backoff_wait(provider["name"])
 
+    detail = f" ({type(last_err).__name__}: {last_err})" if last_err else ""
     raise AllProvidersFailedError(
-        "⚠ Couldn't reach any LLM provider.\n"
-        "  1. Check your keys and connection: ogacode doctor\n"
-        "  2. Use offline mode: ogacode --offline"
+        f"All LLM providers failed.{detail}"
     ) from last_err
 
 

@@ -28,12 +28,33 @@ _SYSTEM = f"""\
 You are OgaCode, an agentic AI coding assistant.
 OS: {_OS}. {_SHELL_NOTE}
 Use tools to complete the user's task step by step.
-- Read files before editing them.
-- Prefer creating files with file_edit over running scaffolding commands.
-- Never create binary files (images, fonts, zips). Use placeholder text or SVG instead.
-- Write real, complete content — not placeholder comments like "add content here".
-- When fully done: DONE: <one-line summary>
-- If you need user input: HELP: <question>
+
+Efficiency rules (CRITICAL — you have limited steps and context):
+- List the project structure ONCE with bash_exec, then act immediately. Do not list again.
+- Only READ a file immediately before editing it. Do not read files for "research".
+- If a project already exists, read only the specific file you need to change, then change it.
+- Batch multiple edits: read one file, edit it, move to the next. Do not read 5 files then edit.
+- Never read CSS, JS, HTML files unless you are about to change them in the same step.
+
+File editing rules:
+- Always READ a file immediately before editing it (not earlier).
+- To change an existing file: use file_edit action='edit' with old_string/new_string (targeted).
+- To create a brand-new file: use file_edit action='create'.
+- Never use action='create' on an existing file just to make a small change — use 'edit'.
+- old_string must be unique in the file. Include enough surrounding lines to make it unique.
+- Never create or read binary files (images, fonts, compiled files). Use CSS/SVG/base64 for graphics.
+- Skip any image or binary file you encounter.
+
+Fix tasks (when user says fix, debug, error, broken, not working):
+- Read the file first. Understand the root cause before touching anything.
+- Use 'edit' for targeted fixes — never rewrite the whole file for a one-line bug.
+- After fixing, VERIFY: run the file with bash_exec, or run tests with test_runner.
+- If the fix does not work, diagnose again and try a different approach.
+- Never say DONE on a fix until you have confirmed it actually works.
+- If you cannot fix after 3 attempts: HELP: <explain what you tried and what's still wrong>
+
+When fully done: DONE: <one SHORT sentence — no markdown, no bullet points, no headers>
+If you need user input: HELP: <question>
 """
 
 _PLAN_SYSTEM = """\
@@ -85,7 +106,7 @@ async def agent_loop(
     bus: EventBus | None = None,
     offline: bool = False,
     use_supervisor: bool = True,
-    max_iterations: int = 20,
+    max_iterations: int = 35,
 ) -> AgentResult:
     """
     Plan -> Act -> Observe -> Correct loop.
@@ -167,11 +188,17 @@ async def agent_loop(
             if not tool:
                 result_tr: ToolResult = ToolResult(success=False, output="", error=f"Unknown tool: {fn_name}")
             else:
-                log_args = {k: v for k, v in kwargs.items() if k != "content"}
+                # Suppress large string args from the event log
+                skip = {"content", "old_string", "new_string"}
+                log_args = {k: v for k, v in kwargs.items() if k not in skip}
+                if "old_string" in kwargs:
+                    log_args["edit"] = f"{len(kwargs['old_string'])}→{len(kwargs.get('new_string',''))} chars"
                 bus.emit(PRE_TOOL, tool=fn_name, args=log_args)
                 result_tr = tool.execute(**kwargs)
-                if fn_name == "file_edit" and result_tr.success and kwargs.get("action") == "create":
-                    files_written.append(kwargs.get("path", ""))
+                if fn_name == "file_edit" and result_tr.success and kwargs.get("action") in ("create", "edit"):
+                    p = kwargs.get("path", "")
+                    if p and p not in files_written:
+                        files_written.append(p)
 
             bus.emit(POST_TOOL, tool=fn_name, success=result_tr.success,
                      output=result_tr.output[:500], error=result_tr.error)

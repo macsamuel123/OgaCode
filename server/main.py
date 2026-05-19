@@ -8,6 +8,8 @@ import re
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+import openclaude_client
+
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -1238,3 +1240,91 @@ async def paystack_webhook(request: Request) -> dict:
     # TODO: handle charge.success → resume suspended account
     # TODO: handle subscription.disable → suspend account after grace period
     return {"received": True, "event": event_type}
+
+
+# ── OpenClaude gRPC bridge ────────────────────────────────────────────────────
+
+@app.get("/agent/stream")
+async def agent_stream(task: str, cwd: str, session_id: str = "default") -> StreamingResponse:
+    """SSE bridge: translates OpenClaude gRPC ServerMessage events → AgentEvent JSON lines.
+
+    OpenClaude must be running: openclaude --grpc  (listens on localhost:50051)
+    """
+
+    async def _sse():
+        try:
+            async for msg in openclaude_client.stream_task(task, cwd, session_id):
+                event = msg.WhichOneof("event")
+
+                if event == "text_chunk":
+                    pass  # suppress raw tokens — summary arrives in FinalResponse
+
+                elif event == "tool_start":
+                    args: dict = {}
+                    try:
+                        args = json.loads(msg.tool_start.arguments_json)
+                    except Exception:
+                        pass
+                    payload = {
+                        "type": "pre_tool_use",
+                        "tool": msg.tool_start.tool_name,
+                        "args": args,
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+                elif event == "tool_result":
+                    payload = {
+                        "type": "post_tool_use",
+                        "tool": msg.tool_result.tool_name,
+                        "success": not msg.tool_result.is_error,
+                        "output": msg.tool_result.output[:500],
+                        "error": msg.tool_result.output if msg.tool_result.is_error else "",
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+                elif event == "action_required":
+                    payload = {
+                        "type": "action_required",
+                        "prompt_id": msg.action_required.prompt_id,
+                        "question": msg.action_required.question,
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+                elif event == "done":
+                    summary = msg.done.full_text.strip()
+                    payload = {
+                        "type": "stop",
+                        "success": True,
+                        "summary": summary[:400],
+                        "files": [],
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    openclaude_client.cancel_task(session_id)
+                    return
+
+                elif event == "error":
+                    payload = {
+                        "type": "stop",
+                        "success": False,
+                        "summary": msg.error.message,
+                        "files": [],
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    return
+
+        except Exception as exc:
+            payload = {"type": "stop", "success": False, "summary": str(exc), "files": []}
+            yield f"data: {json.dumps(payload)}\n\n"
+
+    return StreamingResponse(
+        _sse(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/agent/approve")
+async def agent_approve(session_id: str, prompt_id: str, reply: str = "y") -> dict:
+    """Forward a plan or command approval from the VS Code extension into the live gRPC stream."""
+    ok = openclaude_client.send_approval(session_id, prompt_id, reply)
+    return {"ok": ok}
