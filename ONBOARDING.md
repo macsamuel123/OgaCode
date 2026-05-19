@@ -1,5 +1,48 @@
 # OgaCode — Onboarding Guide
 
+## UAT Quickstart — Complete This Before Testing
+
+Work through every step in order. Do not skip.
+
+**1. Prerequisites**
+- [ ] Node.js 18+ — [nodejs.org](https://nodejs.org) → LTS download
+- [ ] Python 3.9+ — [python.org](https://www.python.org/downloads/)
+- [ ] `pip install keyring` (required to store API keys securely)
+
+**2. Install the SDK** *(allow 2–5 min on slow networks)*
+```
+npm install -g @gitlawb/openclaude
+```
+
+**3. Install the CLI**
+```
+cd C:\Users\User\OgaCode
+pip install -e cli\
+```
+
+**4. Configure an API key** *(free options — no credit card required)*
+```
+ogacode setup
+```
+- Free key: [console.groq.com](https://console.groq.com) → create account → API Keys
+- Budget key: [platform.deepseek.com](https://platform.deepseek.com)
+
+**5. Install the VS Code extension**
+- Open VS Code → Extensions panel (Ctrl+Shift+X) → `⋯` menu → **Install from VSIX…**
+- Select `ogacode-0.0.1.vsix`
+- Open any project folder: **File → Open Folder**
+- Click the OgaCode icon in the left activity bar
+
+**6. Verify everything works**
+```
+ogacode doctor
+```
+All checks must pass before testing. If any fail, fix them before continuing.
+
+Type **"hello"** in the OgaCode sidebar — you should get a response within 30 seconds.
+
+---
+
 ## What Is OgaCode?
 OgaCode is a local-first, agentic AI coding assistant built for Nigerian developers on constrained hardware and expensive mobile data. Think of it as a junior developer that reads files, runs tests, fixes bugs, and commits code autonomously — all from a Python CLI that works offline and costs as little data as possible.
 

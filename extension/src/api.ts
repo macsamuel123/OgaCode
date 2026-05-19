@@ -1,3 +1,9 @@
+/**
+ * LEGACY — not imported by the active extension flow.
+ * Active path: SidebarProvider → cli.ts → runner.mjs
+ * This file serves the optional FastAPI server path (server/main.py).
+ * Delete when server/ is removed.
+ */
 const BASE_URL = process.env['OGACODE_API_URL'] ?? 'http://localhost:8000';
 
 const TIMEOUT_COMPLETION_MS = 8_000;

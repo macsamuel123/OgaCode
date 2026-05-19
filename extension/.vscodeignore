@@ -1,0 +1,8 @@
+node_modules/
+src/
+tsconfig.json
+esbuild.cjs
+package-lock.json
+.vscode/
+out/
+*.map

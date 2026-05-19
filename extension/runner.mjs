@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * openclaude-runner.mjs
- * Thin Node.js wrapper around the @gitlawb/openclaude SDK.
+ * runner.mjs
+ * Thin Node.js wrapper around the OgaCode engine SDK.
  * Spawned by cli.ts for each agent task. Streams JSON lines to stdout.
  *
- * Usage:  node openclaude-runner.mjs "<task>" "<cwd>"
+ * Usage:  node runner.mjs "<task>" "<cwd>"
  *
  * Event JSON lines:
  *   { type: "pre_tool_use",  tool: string, args: object }
@@ -21,11 +21,11 @@ const task = process.argv[2];
 const cwd  = process.argv[3];
 
 if (!task || !cwd) {
-  process.stderr.write('Usage: node openclaude-runner.mjs "<task>" "<cwd>"\n');
+  process.stderr.write('Usage: node runner.mjs "<task>" "<cwd>"\n');
   process.exit(1);
 }
 
-// ── Provider override: prefer DeepSeek → Groq → fallback to whatever OpenClaude has ──
+// ── Provider override: prefer DeepSeek → Groq → fallback to whatever the engine has ──
 // Must be set BEFORE importing the SDK (it reads env at load time).
 if (process.env.DEEPSEEK_API_KEY) {
   process.env.CLAUDE_CODE_USE_OPENAI = 'true';
@@ -39,10 +39,10 @@ if (process.env.DEEPSEEK_API_KEY) {
   process.env.OPENAI_MODEL = process.env.OPENAI_MODEL || 'moonshotai/kimi-k2-instruct';
 }
 
-// ── Locate the SDK in global npm modules ─────────────────────────────────────
+// ── Locate the engine in global npm modules ───────────────────────────────────
 let sdkPath;
 try {
-  const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+  const globalRoot = execSync('npm root -g', { encoding: 'utf8', timeout: 8000 }).trim();
   sdkPath = path.join(globalRoot, '@gitlawb', 'openclaude', 'dist', 'sdk.mjs');
 } catch {
   process.stderr.write('npm not found in PATH\n');
@@ -55,8 +55,7 @@ try {
   query = sdk.query;
 } catch (e) {
   process.stderr.write(
-    `Cannot load @gitlawb/openclaude SDK from ${sdkPath}\n` +
-    `Install it first: npm install -g @gitlawb/openclaude\n` +
+    `Cannot load OgaCode engine from ${sdkPath}\n` +
     `Error: ${e.message}\n`
   );
   process.exit(1);
@@ -74,6 +73,10 @@ function textOf(content) {
   }
   return JSON.stringify(content);
 }
+
+// Signal to the extension that the runner is alive and the engine loaded successfully.
+// This resets the short startup watchdog timer in the sidebar.
+emit({ type: 'runner_started', msg: 'Agent ready' });
 
 // ── Run agent ─────────────────────────────────────────────────────────────────
 try {

@@ -106,7 +106,7 @@ async def agent_loop(
     bus: EventBus | None = None,
     offline: bool = False,
     use_supervisor: bool = True,
-    max_iterations: int = 35,
+    max_iterations: int = 15,
 ) -> AgentResult:
     """
     Plan -> Act -> Observe -> Correct loop.

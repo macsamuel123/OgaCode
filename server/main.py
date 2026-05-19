@@ -29,6 +29,15 @@ FREE_TOKEN_DAILY_LIMIT  = 50_000
 _supabase: AsyncClient | None = None
 
 
+def _provider_status() -> dict:
+    return {
+        "groq":          bool(os.getenv("GROQ_API_KEY")),
+        "deepseek":      bool(os.getenv("DEEPSEEK_API_KEY")),
+        "github_models": bool(os.getenv("GITHUB_TOKEN")),
+        "supabase":      bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_KEY")),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _supabase
@@ -41,6 +50,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     key = os.getenv("SUPABASE_SERVICE_KEY", "")
     if url and key:
         _supabase = await acreate_client(url, key)
+
+    providers = _provider_status()
+    available = [k for k, v in providers.items() if v]
+    if not available:
+        print(
+            "\nWARNING: No LLM providers configured.\n"
+            "  Set GROQ_API_KEY (free at console.groq.com) or DEEPSEEK_API_KEY in server/.env\n"
+            "  All /chat and /fix requests will return 503 until at least one key is set.\n"
+        )
+    else:
+        print(f"\nOgaCode server ready — providers: {', '.join(available)}\n")
+
     yield
 
 
@@ -822,7 +843,14 @@ async def call_llm(
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "service": "ogacode-proxy"}
+    providers = _provider_status()
+    any_llm = providers["groq"] or providers["deepseek"] or providers["github_models"]
+    return {
+        "status": "ok" if any_llm else "degraded",
+        "service": "ogacode-proxy",
+        "providers": providers,
+        **({"warning": "No LLM provider configured — set GROQ_API_KEY or DEEPSEEK_API_KEY in server/.env"} if not any_llm else {}),
+    }
 
 
 @app.get("/history/{user_id}")

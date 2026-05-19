@@ -1,6 +1,43 @@
 import { spawn, execSync } from 'child_process';
 import * as path from 'path';
 
+let _keychainCheck: { ok: boolean; msg: string } | null = null;
+
+/**
+ * Pre-flight: verify Python + keyring are reachable before spawning the runner.
+ * Skipped entirely when DEEPSEEK_API_KEY or GROQ_API_KEY is already in the environment.
+ * Result is cached for the session so repeated calls are free.
+ */
+export function checkKeychainSetup(): { ok: boolean; msg: string } {
+  if (process.env['DEEPSEEK_API_KEY'] || process.env['GROQ_API_KEY']) {
+    return { ok: true, msg: '' };
+  }
+  if (_keychainCheck !== null) { return _keychainCheck; }
+
+  try {
+    execSync('python --version', { timeout: 3000, stdio: 'pipe' });
+  } catch {
+    _keychainCheck = {
+      ok: false,
+      msg: 'Python not found in PATH. Install Python and run "ogacode setup" to store your API key, or set DEEPSEEK_API_KEY / GROQ_API_KEY in your environment.',
+    };
+    return _keychainCheck;
+  }
+
+  try {
+    execSync('python -c "import keyring"', { timeout: 3000, stdio: 'pipe' });
+  } catch {
+    _keychainCheck = {
+      ok: false,
+      msg: '"keyring" package not installed. Run: pip install keyring',
+    };
+    return _keychainCheck;
+  }
+
+  _keychainCheck = { ok: true, msg: '' };
+  return _keychainCheck;
+}
+
 export interface AgentEvent {
   type: string;
   [key: string]: unknown;
@@ -12,9 +49,9 @@ export interface AgentResult {
   files: string[];
 }
 
-// openclaude-runner.mjs lives next to this file's compiled output (dist/)
+// runner.mjs lives next to this file's compiled output (dist/)
 // __dirname = extension/dist at runtime
-const RUNNER = path.join(__dirname, '..', 'openclaude-runner.mjs');
+const RUNNER = path.join(__dirname, '..', 'runner.mjs');
 
 /** Read a key from the Python keychain (ogacode service). Returns empty string on failure. */
 function readKeychain(keyName: string): string {
@@ -30,17 +67,16 @@ function readKeychain(keyName: string): string {
 }
 
 /**
- * Spawns openclaude-runner.mjs which uses the @gitlawb/openclaude SDK.
+ * Spawns runner.mjs which wraps the OgaCode engine SDK.
  * Passes DeepSeek/Groq API keys from the OS keychain so the runner
- * can override OpenClaude's default Anthropic provider.
- * Requires: npm install -g @gitlawb/openclaude
+ * can select the right LLM provider.
  */
 export function runAgent(
   task: string,
   cwd: string,
   onEvent: (evt: AgentEvent) => void,
 ): Promise<AgentResult> {
-  // Build env with provider keys so openclaude-runner can pick the right LLM
+  // Build env with provider keys so the runner can pick the right LLM
   const deepseekKey = readKeychain('deepseek_api_key');
   const groqKey     = readKeychain('groq_api_key');
   const env: NodeJS.ProcessEnv = {
@@ -92,10 +128,7 @@ export function runAgent(
       if (result.summary) {
         resolve(result);
       } else if (code !== 0) {
-        reject(new Error(
-          `openclaude-runner exited ${code ?? '?'}\n` +
-          'Make sure @gitlawb/openclaude is installed: npm install -g @gitlawb/openclaude'
-        ));
+        reject(new Error(`OgaCode engine exited with code ${code ?? '?'}. See ONBOARDING.md for setup steps.`));
       } else {
         resolve(result);
       }

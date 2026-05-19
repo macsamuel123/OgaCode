@@ -32,11 +32,16 @@
       ]
     }
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/macsamuel123/OgaCode.git"
+  },
   "scripts": {
     "build": "node esbuild.cjs",
     "build:prod": "node esbuild.cjs --production",
     "watch": "node esbuild.cjs --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "package": "node esbuild.cjs --production && npx @vscode/vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

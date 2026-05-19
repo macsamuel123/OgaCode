@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { exec } from 'child_process';
-import { runAgent, AgentEvent } from '../cli';
+import { runAgent, AgentEvent, checkKeychainSetup } from '../cli';
 import { getNonce } from '../utils/nonce';
 import { PreviewPanel } from '../preview/PreviewPanel';
 
@@ -94,6 +94,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      const preflight = checkKeychainSetup();
+      if (!preflight.ok) {
+        this._send('chatError', { msg: `Setup required: ${preflight.msg}` });
+        return;
+      }
+
       const history = this._getHistory();
       const enriched = this._enrichPrompt(message.prompt, cwd, history);
       const userTurn: Turn = { role: 'user', content: message.prompt };
@@ -171,7 +177,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       const frontendPath = path.join(folder, 'frontend');
       const terminal = vscode.window.createTerminal({ name: 'OgaCode Dev' });
       terminal.show();
-      terminal.sendText(`Set-Location "${frontendPath}"; npm install; npm run dev`);
+      terminal.sendText(`cd "${frontendPath}" ; npm install ; npm run dev`);
       let attempts = 0;
       const poll = setInterval(() => {
         attempts++;
@@ -197,7 +203,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       if (!folder) { this._send('expoError', { error: 'No workspace open' }); return; }
       const terminal = vscode.window.createTerminal({ name: 'OgaCode Expo' });
       terminal.show();
-      terminal.sendText(`Set-Location "${folder}"; npx expo start`);
+      terminal.sendText(`cd "${folder}" ; npx expo start`);
       let expoAttempts = 0;
       const expoPoll = setInterval(() => {
         expoAttempts++;
@@ -610,6 +616,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     var saveMemBtn  = document.getElementById('saveMemBtn');
 
     var currentBot = null;  // the bot message being built right now
+    var runnerStarted = false; // true once the first agentEvent arrives
 
     /* ── Helpers ── */
     function esc(s) {
@@ -710,13 +717,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       inp.value = '';
       inp.style.height = 'auto';
       sendbtn.disabled = true;
+      runnerStarted = false;
       addUserMsg(text);
       startBotMsg();
       api.postMessage({ command: 'chat', prompt: text });
+      // 45 s startup watchdog — resets to 180 s once the runner emits its first event
       sendTimer = setTimeout(function() {
         unlockSend();
-        finishBotMsg('No response received. Check your connection and try again.', true);
-      }, 180000);
+        finishBotMsg('OgaCode engine did not start. Check ONBOARDING.md for setup steps.', true);
+      }, 45000);
     }
 
     sendbtn.addEventListener('click', send);
@@ -800,9 +809,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       if (d.command === 'agentEvent') {
         var line = formatEvent(d);
         if (line) { addActivity(line); }
-        // Reset timeout — agent is alive and making progress
+        // First event: runner is alive — switch from startup watchdog to full 180 s timeout
         if (sendTimer) {
           clearTimeout(sendTimer);
+          runnerStarted = true;
           sendTimer = setTimeout(function() {
             unlockSend();
             finishBotMsg('No response received. Check your connection and try again.', true);
