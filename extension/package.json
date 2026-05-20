@@ -18,7 +18,7 @@
       "properties": {
         "ogacode.serverUrl": {
           "type": "string",
-          "default": "",
+          "default": "https://ogacode-production.up.railway.app",
           "description": "OgaCode server URL. When set, personal API keys are not required — the server holds them."
         },
         "ogacode.token": {
