@@ -29,6 +29,8 @@ def make_console_listener(console: Console, *, as_json: bool = False):
     Prints agent events to the terminal.
     In --stream / --json mode, emits raw JSON lines instead.
     """
+    _current_provider: list[str] = [""]
+
     def listener(event: dict[str, Any]) -> None:
         t = event.get("type", "")
 
@@ -37,20 +39,23 @@ def make_console_listener(console: Console, *, as_json: bool = False):
             return
 
         if t == THINKING:
-            console.print(f"  [dim]>[/] Thinking... (step {event.get('step', '?')})")
+            step = event.get("step", "?")
+            console.print(f"  [dim]·[/] [dim]Thinking[/]  [dim](step {step})[/]")
         elif t == PROVIDER:
-            console.print(f"  [dim]>[/] Using {event.get('name', '')}")
+            _current_provider[0] = event.get("name", "")
         elif t == PRE_TOOL:
             args = event.get("args", {})
-            arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
-            console.print(f"  [dim]>[/] {event.get('tool', '')}({arg_str})")
+            arg_str = "  ".join(f"[dim]{k}[/]=[dim white]{v!r}[/]" for k, v in args.items())
+            tool = event.get("tool", "")
+            console.print(f"  [cyan]▸[/] [bold cyan]{tool}[/]  {arg_str}")
         elif t == POST_TOOL:
             if not event.get("success"):
-                console.print(f"  [dim red]! {event.get('error', 'failed')}[/]")
+                err = (event.get("error") or "failed")[:120]
+                console.print(f"  [red]✗[/] [dim red]{err}[/]")
         elif t == CORRECTION:
-            console.print(f"  [yellow]~[/] {event.get('msg', '')}")
+            console.print(f"  [yellow]↺[/] [dim yellow]{event.get('msg', '')}[/]")
         elif t == SUPERVISOR:
-            console.print(f"  [dim]>[/] {event.get('msg', '')}")
+            console.print(f"  [magenta]◈[/] [dim]{event.get('msg', '')}[/]")
         elif t == ESCALATE:
             console.print(f"  [bold yellow]?[/] {event.get('msg', '')}")
 

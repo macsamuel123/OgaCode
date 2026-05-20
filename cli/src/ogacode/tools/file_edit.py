@@ -46,6 +46,10 @@ class FileEditTool(Tool):
                 "type": "string",
                 "description": "File path relative to project root",
             },
+            "offset": {
+                "type": "integer",
+                "description": "Character offset to start reading from (default 0). Use to page through large files.",
+            },
             "content": {
                 "type": "string",
                 "description": "Full content (required for create/append)",
@@ -72,6 +76,7 @@ class FileEditTool(Tool):
         content: str = "",
         old_string: str = "",
         new_string: str = "",
+        offset: int = 0,
         **_: Any,
     ) -> ToolResult:
         target = (self._cwd / path).resolve()
@@ -84,12 +89,15 @@ class FileEditTool(Tool):
         if action == "read":
             try:
                 raw = target.read_bytes()
-                # Reject binary files — sending them to the LLM corrupts the conversation
                 if b"\x00" in raw[:8192] or _is_binary(raw[:512]):
                     return ToolResult(success=False, output="",
                                       error=f"'{path}' is a binary file (image/font/compiled). Cannot read it.")
                 text = raw.decode("utf-8", errors="replace")
-                return ToolResult(success=True, output=text[:4000])
+                chunk = text[offset:offset + 8000]
+                remaining = max(0, len(text) - offset - 8000)
+                header = f"[chars {offset}–{offset + len(chunk)} of {len(text)}]\n" if offset or remaining else ""
+                footer = f"\n[{remaining} more chars — call read with offset={offset + 8000} to continue]" if remaining else ""
+                return ToolResult(success=True, output=header + chunk + footer)
             except FileNotFoundError:
                 return ToolResult(success=False, output="", error=f"File not found: {path}")
             except Exception as exc:

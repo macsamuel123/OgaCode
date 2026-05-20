@@ -15,9 +15,23 @@ interface Memory {
   skills: string;
 }
 
+interface Chat {
+  id: string;
+  name: string;
+  project: string;
+  projectPath: string;
+  createdAt: string;
+  updatedAt: string;
+  turns: Turn[];
+}
+
+const CHATS_KEY = 'ogacode.chats.v2';
+const ACTIVE_CHAT_KEY = 'ogacode.activeChatId';
+
 export class SidebarProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   private _lastPreviewFile: string | undefined;
+  private _abortController: AbortController | undefined;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -62,20 +76,77 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = this._getHtml(webviewView.webview);
     webviewView.webview.onDidReceiveMessage(this._handleMessage.bind(this));
-    // Send project name once the webview is ready
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (folder) {
-      setTimeout(() => this._send('setProject', { name: folder.name }), 200);
-    }
+    // Restore the last active chat so thread + historyBtn are correct on reload
+    setTimeout(() => {
+      const chat = this._getActiveChat();
+      if (chat && chat.turns.length > 0) {
+        this._send('chatLoaded', { turns: chat.turns, chatName: chat.name, chatId: chat.id });
+      } else if (chat) {
+        this._send('chatNamed', { id: chat.id, name: chat.name });
+      }
+    }, 200);
   }
 
   private _getCwd(): string {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
   }
 
+  private _readKeychain(keyName: string): string {
+    try {
+      const { execSync } = require('child_process') as typeof import('child_process');
+      return execSync(
+        `python -c "import keyring; v=keyring.get_password('ogacode','${keyName}'); print(v or '')"`,
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim();
+    } catch { return ''; }
+  }
+
+  private async _describeImage(dataUrl: string): Promise<string> {
+    const groqKey = this._readKeychain('groq_api_key');
+    if (!groqKey) { return ''; }
+    const body = JSON.stringify({
+      model: 'llama-3.2-11b-vision-preview',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe this screenshot in detail for a developer debugging a bug. Include all visible: error messages, UI state, code, stack traces, console output, and any other relevant details.' },
+          { type: 'image_url', image_url: { url: dataUrl } },
+        ],
+      }],
+      max_tokens: 800,
+    });
+    return new Promise((resolve) => {
+      const https = require('https') as typeof import('https');
+      const req = https.request({
+        hostname: 'api.groq.com',
+        path: '/openai/v1/chat/completions',
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${groqKey}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk: Buffer) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data) as { choices?: Array<{ message?: { content?: string } }> };
+            resolve(json.choices?.[0]?.message?.content ?? '');
+          } catch { resolve(''); }
+        });
+      });
+      req.on('error', () => resolve(''));
+      req.setTimeout(15000, () => { req.destroy(); resolve(''); });
+      req.write(body);
+      req.end();
+    });
+  }
+
   private async _handleMessage(message: {
     command: string;
     prompt?: string;
+    image?: string;
     cmd?: string;
     url?: string;
     subdir?: string;
@@ -94,22 +165,37 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      const preflight = checkKeychainSetup();
+      const cfg = vscode.workspace.getConfiguration('ogacode');
+      const serverUrl = cfg.get<string>('serverUrl', '').trim();
+      const token     = cfg.get<string>('token', '').trim();
+
+      const preflight = checkKeychainSetup(serverUrl || undefined);
       if (!preflight.ok) {
         this._send('chatError', { msg: `Setup required: ${preflight.msg}` });
         return;
       }
 
-      const history = this._getHistory();
-      const enriched = this._enrichPrompt(message.prompt, cwd, history);
-      const userTurn: Turn = { role: 'user', content: message.prompt };
-      await this._setHistory([...history, userTurn]);
-
+      this._abortController = new AbortController();
       try {
+        const activeChat = await this._ensureActiveChat();
+        const history = activeChat.turns;
+        let userPrompt = message.prompt;
+        if (message.image) {
+          this._send('agentEvent', { type: 'thinking', step: 0, msg: 'Analysing screenshot…' });
+          const description = await this._describeImage(message.image);
+          if (description) {
+            userPrompt = `[Screenshot attached — vision analysis:\n${description}]\n\n${message.prompt}`;
+          }
+        }
+        const enriched = this._enrichPrompt(userPrompt, cwd, history);
+        const userTurn: Turn = { role: 'user', content: message.prompt };
         const result = await runAgent(
           enriched,
           cwd,
           (evt: AgentEvent) => this._send('agentEvent', evt),
+          this._abortController.signal,
+          serverUrl || undefined,
+          token || undefined,
         );
         const summary = result.summary || (result.success ? 'Done.' : 'Task finished with no summary.');
         const assistantTurn: Turn = {
@@ -118,7 +204,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             ? `${summary}\nFiles touched: ${result.files.join(', ')}`
             : summary,
         };
-        await this._setHistory([...this._getHistory(), assistantTurn]);
+        const newTurns = [...history, userTurn, assistantTurn];
+        await this._updateChatTurns(activeChat.id, newTurns);
+        if (history.length === 0) {
+          await this._autoNameChat(activeChat.id, message.prompt);
+          this._send('chatNamed', { id: activeChat.id, name: this._nameChatFromMessage(message.prompt) });
+        }
         this._send('chatDone', { success: result.success, summary, files: result.files });
 
         if (result.files.length > 0) {
@@ -284,8 +375,58 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
 
     if (message.command === 'newChat') {
-      await this._clearHistory();
-      this._send('chatCleared', {});
+      const chat = await this._createNewChat();
+      this._send('chatCleared', { chatId: chat.id, chatName: chat.name });
+      return;
+    }
+
+    if (message.command === 'listChats') {
+      const chats = this._getAllChats().sort(
+        (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+      );
+      const activeChatId = this._ctx.globalState.get<string>(ACTIVE_CHAT_KEY) ?? '';
+      this._send('chatList', { chats, activeChatId });
+      return;
+    }
+
+    if (message.command === 'switchChat' && message.prompt) {
+      const chatId = message.prompt; // reuse prompt field for chatId
+      await this._ctx.globalState.update(ACTIVE_CHAT_KEY, chatId);
+      const chat = this._getAllChats().find(c => c.id === chatId);
+      if (chat) {
+        this._send('chatLoaded', { turns: chat.turns, chatName: chat.name, chatId: chat.id });
+      }
+      return;
+    }
+
+    if (message.command === 'renameChat' && message.prompt && message.slot) {
+      const chatId = message.prompt;
+      const name = message.slot;
+      const chats = this._getAllChats().map(c => c.id === chatId ? { ...c, name } : c);
+      await this._saveAllChats(chats);
+      this._send('chatRenamed', { chatId, name });
+      return;
+    }
+
+    if (message.command === 'deleteChat' && message.prompt) {
+      const chatId = message.prompt;
+      let chats = this._getAllChats().filter(c => c.id !== chatId);
+      const activeChatId = this._ctx.globalState.get<string>(ACTIVE_CHAT_KEY);
+      let nextChat: Chat | undefined;
+      if (activeChatId === chatId) {
+        nextChat = chats[0] ?? await this._createNewChat();
+        if (!chats.length) { chats = this._getAllChats(); }
+        await this._ctx.globalState.update(ACTIVE_CHAT_KEY, nextChat.id);
+      }
+      await this._saveAllChats(chats);
+      const active = nextChat ?? this._getAllChats().find(c => c.id === this._ctx.globalState.get<string>(ACTIVE_CHAT_KEY));
+      this._send('chatDeleted', { turns: active?.turns ?? [], chatName: active?.name ?? 'New Chat' });
+      return;
+    }
+
+    if (message.command === 'stopAgent') {
+      this._abortController?.abort();
+      this._abortController = undefined;
       return;
     }
 
@@ -400,6 +541,58 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     return enriched + context;
   }
 
+  private _getAllChats(): Chat[] {
+    return this._ctx.globalState.get<Chat[]>(CHATS_KEY) ?? [];
+  }
+
+  private async _saveAllChats(chats: Chat[]): Promise<void> {
+    await this._ctx.globalState.update(CHATS_KEY, chats);
+  }
+
+  private _getActiveChat(): Chat | undefined {
+    const id = this._ctx.globalState.get<string>(ACTIVE_CHAT_KEY);
+    return id ? this._getAllChats().find(c => c.id === id) : undefined;
+  }
+
+  private _nameChatFromMessage(msg: string): string {
+    return msg.trim().slice(0, 32) + (msg.trim().length > 32 ? '…' : '');
+  }
+
+  private async _createNewChat(): Promise<Chat> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const now = new Date().toISOString();
+    const chat: Chat = {
+      id: `chat_${Date.now()}`,
+      name: 'New Chat',
+      project: folder?.name ?? 'No Project',
+      projectPath: folder?.uri.fsPath ?? '',
+      createdAt: now,
+      updatedAt: now,
+      turns: [],
+    };
+    const chats = this._getAllChats();
+    await this._saveAllChats([chat, ...chats]);
+    await this._ctx.globalState.update(ACTIVE_CHAT_KEY, chat.id);
+    return chat;
+  }
+
+  private async _ensureActiveChat(): Promise<Chat> {
+    return this._getActiveChat() ?? await this._createNewChat();
+  }
+
+  private async _updateChatTurns(id: string, turns: Turn[]): Promise<void> {
+    const chats = this._getAllChats().map(c =>
+      c.id === id ? { ...c, turns, updatedAt: new Date().toISOString() } : c
+    );
+    await this._saveAllChats(chats);
+  }
+
+  private async _autoNameChat(id: string, firstMessage: string): Promise<void> {
+    const name = this._nameChatFromMessage(firstMessage);
+    const chats = this._getAllChats().map(c => c.id === id ? { ...c, name } : c);
+    await this._saveAllChats(chats);
+  }
+
   private _send(command: string, data: Record<string, unknown>): void {
     this._view?.webview.postMessage({ command, ...data });
   }
@@ -410,7 +603,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src https://api.qrserver.com;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src https://api.qrserver.com data:;">
   <title>OgaCode</title>
   <style nonce="${nonce}">
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -492,6 +685,31 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     #runbtn  { display: none; width: 100%; margin-top: 4px; }
     #expobtn { display: none; width: 100%; margin-top: 4px; }
 
+    /* ── History dropdown ── */
+    #topbar { position: relative; }
+    #historyBtn {
+      flex: 1; text-align: left; background: none; border: none; color: inherit;
+      font-size: 11px; font-weight: 600; cursor: pointer;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 170px;
+      padding: 0;
+    }
+    #historyDropdown {
+      position: absolute; top: 28px; left: 0; right: 0; z-index: 100;
+      background: var(--vscode-menu-background, #252526);
+      border: 1px solid var(--vscode-panel-border, #333);
+      max-height: 260px; overflow-y: auto; display: none;
+    }
+    .hd-item {
+      display: flex; align-items: center; gap: 4px; padding: 5px 8px;
+      cursor: pointer; font-size: 11px;
+    }
+    .hd-item:hover, .hd-item.active { background: var(--vscode-list-hoverBackground, #2a2d2e); }
+    .hd-proj { font-size: 9px; opacity: 0.5; margin: 6px 8px 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .hd-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hd-actions { display: flex; gap: 2px; opacity: 0; flex-shrink: 0; }
+    .hd-item:hover .hd-actions { opacity: 1; }
+    .hd-new { border-top: 1px solid var(--vscode-panel-border, #333); color: var(--vscode-textLink-foreground, #4fc); }
+
     /* ── Input area ── */
     #inputArea {
       padding: 8px;
@@ -499,11 +717,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
     #inputRow { display: flex; gap: 4px; align-items: flex-end; }
     textarea {
-      flex: 1; min-height: 36px; max-height: 120px;
+      flex: 1; min-height: 36px;
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
       border: 1px solid var(--vscode-input-border, #555);
-      padding: 6px 8px; font: inherit; resize: none; overflow: hidden;
+      padding: 6px 8px; font: inherit; resize: none; overflow-y: auto;
     }
     .icon-btn {
       flex-shrink: 0; width: 32px; height: 32px;
@@ -520,7 +738,31 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       font-size: 16px; display: flex; align-items: center; justify-content: center;
     }
     #sendbtn:disabled, .icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    #stopbtn {
+      display: none; flex-shrink: 0; width: 32px; height: 32px;
+      background: #8b0000; color: #fff;
+      border: none; cursor: pointer; border-radius: 4px;
+      font-size: 14px; align-items: center; justify-content: center;
+    }
+    #stopbtn.visible { display: flex; }
     #hint { font-size: 10px; opacity: 0.45; margin-top: 4px; text-align: center; }
+
+    /* ── Image preview ── */
+    #imagePreview {
+      display: none; position: relative; margin-top: 4px; width: fit-content;
+    }
+    #imagePreview img {
+      max-height: 72px; max-width: 100%; border-radius: 4px;
+      border: 1px solid var(--vscode-input-border, #555); display: block;
+    }
+    #removeImg {
+      position: absolute; top: -5px; right: -5px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none; border-radius: 50%; width: 16px; height: 16px;
+      font-size: 11px; cursor: pointer; line-height: 16px; text-align: center; padding: 0;
+    }
+    .user .bubble img { max-height: 120px; border-radius: 4px; display: block; margin-bottom: 4px; }
 
     /* ── Memory panel ── */
     #memoryPanel {
@@ -548,10 +790,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div id="topbar">
-    <span id="projectLabel"></span>
-    <div style="display:flex;gap:4px;">
+    <button id="historyBtn">New Chat &#9662;</button>
+    <div id="historyDropdown"></div>
+    <div style="display:flex;gap:4px;flex-shrink:0;">
       <button class="icon-btn" id="memorybtn" title="Project memory">&#128203;</button>
-      <button class="icon-btn" id="newchatbtn" title="New chat">&#128465;</button>
+      <button class="icon-btn" id="newchatbtn" title="New chat">&#65291;</button>
     </div>
   </div>
   <div id="memoryPanel">
@@ -585,9 +828,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   </div>
 
   <div id="inputArea">
+    <div id="imagePreview">
+      <img id="previewImg" src="" alt="pasted screenshot">
+      <button id="removeImg" title="Remove image">&#215;</button>
+    </div>
     <div id="inputRow">
-      <textarea id="inp" rows="1" placeholder="Ask me anything…"></textarea>
+      <textarea id="inp" rows="1" placeholder="Ask me anything… (paste a screenshot)"></textarea>
       <button class="icon-btn" id="prevbtn" title="Preview HTML">&#128065;</button>
+      <button id="stopbtn" title="Stop">&#9632;</button>
       <button id="sendbtn" title="Send (Enter)">&#10148;</button>
     </div>
     <button type="button" id="runbtn">&#9654; Run Dev Server</button>
@@ -596,17 +844,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   </div>
 
   <script nonce="${nonce}">
-    var api         = acquireVsCodeApi();
-    var thread      = document.getElementById('thread');
-    var inp         = document.getElementById('inp');
-    var sendbtn     = document.getElementById('sendbtn');
-    var prevbtn     = document.getElementById('prevbtn');
-    var runbtn      = document.getElementById('runbtn');
-    var expobtn     = document.getElementById('expobtn');
-    var newchatbtn  = document.getElementById('newchatbtn');
-    var projLabel   = document.getElementById('projectLabel');
-    var memorybtn   = document.getElementById('memorybtn');
-    var memPanel    = document.getElementById('memoryPanel');
+    var api            = acquireVsCodeApi();
+    var thread         = document.getElementById('thread');
+    var inp            = document.getElementById('inp');
+    var sendbtn        = document.getElementById('sendbtn');
+    var prevbtn        = document.getElementById('prevbtn');
+    var runbtn         = document.getElementById('runbtn');
+    var expobtn        = document.getElementById('expobtn');
+    var newchatbtn     = document.getElementById('newchatbtn');
+    var memorybtn      = document.getElementById('memorybtn');
+    var memPanel       = document.getElementById('memoryPanel');
+    var historyBtn     = document.getElementById('historyBtn');
+    var historyDropdown = document.getElementById('historyDropdown');
     var memPrd      = document.getElementById('memPrd');
     var memRules    = document.getElementById('memRules');
     var memSkills   = document.getElementById('memSkills');
@@ -617,6 +866,126 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     var currentBot = null;  // the bot message being built right now
     var runnerStarted = false; // true once the first agentEvent arrives
+    var pendingImage = null;  // base64 data URL of pasted screenshot
+    var activeChatId = null;
+    var stopbtn = document.getElementById('stopbtn');
+
+    stopbtn.addEventListener('click', function() {
+      api.postMessage({ command: 'stopAgent' });
+      stopbtn.classList.remove('visible');
+      sendbtn.disabled = false;
+      finishBotMsg('Interrupted.', true);
+    });
+
+    /* ── History dropdown helpers ── */
+    function renderChatList(chats, activeId) {
+      activeChatId = activeId;
+      historyDropdown.innerHTML = '';
+      var groups = {};
+      chats.forEach(function(c) { (groups[c.project] = groups[c.project] || []).push(c); });
+      Object.keys(groups).forEach(function(proj) {
+        var lbl = document.createElement('div');
+        lbl.className = 'hd-proj'; lbl.textContent = proj;
+        historyDropdown.appendChild(lbl);
+        groups[proj].forEach(function(c) { historyDropdown.appendChild(makeChatItem(c, activeId)); });
+      });
+      var newRow = document.createElement('div');
+      newRow.className = 'hd-item hd-new';
+      newRow.innerHTML = '<span class="hd-name">&#65291; New Chat</span>';
+      newRow.addEventListener('click', function() {
+        historyDropdown.style.display = 'none';
+        api.postMessage({ command: 'newChat' });
+      });
+      historyDropdown.appendChild(newRow);
+    }
+
+    function makeChatItem(c, activeId) {
+      var el = document.createElement('div');
+      el.className = 'hd-item' + (c.id === activeId ? ' active' : '');
+      el.innerHTML =
+        '<span class="hd-name">' + esc(c.name) + '</span>' +
+        '<span class="hd-actions">' +
+        '<button class="icon-btn" style="width:18px;height:18px;font-size:10px" title="Rename">&#9998;</button>' +
+        '<button class="icon-btn" style="width:18px;height:18px;font-size:10px" title="Delete">&#128465;</button>' +
+        '</span>';
+      el.querySelector('.hd-name').addEventListener('click', function() {
+        historyDropdown.style.display = 'none';
+        api.postMessage({ command: 'switchChat', prompt: c.id });
+      });
+      var btns = el.querySelectorAll('.icon-btn');
+      btns[0].addEventListener('click', function(e) {
+        e.stopPropagation();
+        var newName = prompt('Rename chat:', c.name);
+        if (newName && newName.trim()) { api.postMessage({ command: 'renameChat', prompt: c.id, slot: newName.trim() }); }
+      });
+      btns[1].addEventListener('click', function(e) {
+        e.stopPropagation();
+        if (confirm('Delete "' + c.name + '"?')) { api.postMessage({ command: 'deleteChat', prompt: c.id }); }
+      });
+      return el;
+    }
+
+    function repopulateThread(turns, chatName) {
+      thread.innerHTML = '';
+      if (!turns || !turns.length) {
+        thread.innerHTML = '<div class="msg bot"><div class="bubble">Hey! I&#39;m OgaCode. Tell me what to build or fix.</div></div>';
+      } else {
+        turns.forEach(function(t) {
+          if (t.role === 'user') { addUserMsg(t.content, null); }
+          else {
+            var el = document.createElement('div');
+            el.className = 'msg bot';
+            el.innerHTML = '<div class="bubble">' + mdToHtml(t.content) + '</div><div class="activity"></div><div class="files"></div>';
+            thread.appendChild(el);
+          }
+        });
+      }
+      if (chatName) { historyBtn.textContent = chatName + ' ▾'; }
+      scrollBottom();
+    }
+
+    historyBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var open = historyDropdown.style.display === 'none' || historyDropdown.style.display === '';
+      historyDropdown.style.display = open ? 'block' : 'none';
+      if (open) { api.postMessage({ command: 'listChats' }); }
+    });
+
+    document.addEventListener('click', function(e) {
+      if (!historyBtn.contains(e.target) && !historyDropdown.contains(e.target)) {
+        historyDropdown.style.display = 'none';
+      }
+    });
+
+    /* ── Image paste ── */
+    var imagePreview = document.getElementById('imagePreview');
+    var previewImg   = document.getElementById('previewImg');
+    var removeImg    = document.getElementById('removeImg');
+
+    inp.addEventListener('paste', function(e) {
+      var items = e.clipboardData && e.clipboardData.items;
+      if (!items) { return; }
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].type.startsWith('image/')) {
+          e.preventDefault();
+          var file = items[i].getAsFile();
+          var reader = new FileReader();
+          reader.onload = function(ev) {
+            pendingImage = ev.target.result;
+            previewImg.src = pendingImage;
+            imagePreview.style.display = 'block';
+          };
+          reader.readAsDataURL(file);
+          break;
+        }
+      }
+    });
+
+    removeImg.addEventListener('click', function() {
+      pendingImage = null;
+      previewImg.src = '';
+      imagePreview.style.display = 'none';
+    });
 
     /* ── Helpers ── */
     function esc(s) {
@@ -633,10 +1002,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     function scrollBottom() { thread.scrollTop = thread.scrollHeight; }
 
-    function addUserMsg(text) {
+    function addUserMsg(text, imgSrc) {
       var el = document.createElement('div');
       el.className = 'msg user';
-      el.innerHTML = '<div class="bubble">' + esc(text) + '</div>';
+      var imgHtml = imgSrc ? '<img src="' + imgSrc + '" alt="screenshot">' : '';
+      el.innerHTML = '<div class="bubble">' + imgHtml + esc(text) + '</div>';
       thread.appendChild(el);
       scrollBottom();
     }
@@ -707,6 +1077,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     var sendTimer = null;
     function unlockSend() {
       sendbtn.disabled = false;
+      stopbtn.classList.remove('visible');
       if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
     }
 
@@ -717,10 +1088,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       inp.value = '';
       inp.style.height = 'auto';
       sendbtn.disabled = true;
+      stopbtn.classList.add('visible');
       runnerStarted = false;
-      addUserMsg(text);
+      var imageToSend = pendingImage;
+      pendingImage = null;
+      previewImg.src = '';
+      imagePreview.style.display = 'none';
+      addUserMsg(text, imageToSend);
       startBotMsg();
-      api.postMessage({ command: 'chat', prompt: text });
+      api.postMessage({ command: 'chat', prompt: text, image: imageToSend || undefined });
       // 45 s startup watchdog — resets to 180 s once the runner emits its first event
       sendTimer = setTimeout(function() {
         unlockSend();
@@ -740,15 +1116,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
 
     inp.addEventListener('input', function() {
-      var val = inp.value;
-      var nl  = val.indexOf('\\n');
-      if (nl !== -1 && !shiftDown) {
-        inp.value = val.slice(0, nl);
-        send();
-        return;
-      }
       inp.style.height = 'auto';
-      inp.style.height = Math.min(inp.scrollHeight, 120) + 'px';
+      inp.style.height = inp.scrollHeight + 'px';
     });
 
     prevbtn.addEventListener('click', function() {
@@ -796,12 +1165,40 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       var d = e.data;
 
       if (d.command === 'setProject') {
-        projLabel.textContent = d.name || '';
+        // project name now shown per-chat in dropdown
         return;
       }
 
       if (d.command === 'chatCleared') {
-        thread.innerHTML = '<div class="msg bot"><div class="bubble">New chat started. What would you like to build or change?</div></div>';
+        repopulateThread([], d.chatName || 'New Chat');
+        unlockSend();
+        return;
+      }
+
+      if (d.command === 'chatList') {
+        renderChatList(d.chats || [], d.activeChatId || '');
+        return;
+      }
+
+      if (d.command === 'chatLoaded') {
+        repopulateThread(d.turns || [], d.chatName);
+        unlockSend();
+        return;
+      }
+
+      if (d.command === 'chatNamed') {
+        historyBtn.textContent = (d.name || 'Chat') + ' ▾';
+        return;
+      }
+
+      if (d.command === 'chatRenamed') {
+        if (d.chatId === activeChatId) { historyBtn.textContent = (d.name || 'Chat') + ' ▾'; }
+        if (historyDropdown.style.display !== 'none') { api.postMessage({ command: 'listChats' }); }
+        return;
+      }
+
+      if (d.command === 'chatDeleted') {
+        repopulateThread(d.turns || [], d.chatName);
         unlockSend();
         return;
       }

@@ -25,9 +25,15 @@ if (!task || !cwd) {
   process.exit(1);
 }
 
-// ── Provider override: prefer DeepSeek → Groq → fallback to whatever the engine has ──
+// ── Provider: server (managed keys) → DeepSeek → Groq ────────────────────────
 // Must be set BEFORE importing the SDK (it reads env at load time).
-if (process.env.DEEPSEEK_API_KEY) {
+if (process.env.OGACODE_SERVER_URL) {
+  // Managed mode: user's OgaCode token authenticates to the server; no personal API key needed.
+  process.env.CLAUDE_CODE_USE_OPENAI = 'true';
+  process.env.OPENAI_BASE_URL = process.env.OGACODE_SERVER_URL + '/v1';
+  process.env.OPENAI_API_KEY  = process.env.OGACODE_TOKEN || 'ogacode';
+  process.env.OPENAI_MODEL    = process.env.OPENAI_MODEL  || 'deepseek-chat';
+} else if (process.env.DEEPSEEK_API_KEY) {
   process.env.CLAUDE_CODE_USE_OPENAI = 'true';
   process.env.OPENAI_API_KEY = process.env.DEEPSEEK_API_KEY;
   process.env.OPENAI_BASE_URL = 'https://api.deepseek.com/v1';

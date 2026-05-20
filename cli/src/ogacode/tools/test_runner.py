@@ -29,9 +29,12 @@ class TestRunnerTool(Tool):
                 error="No test runner found. Expected: pytest, npm test, or cargo test.",
             )
         try:
-            proc = subprocess.run(cmd, shell=True, cwd=str(run_dir), capture_output=True, text=True, timeout=60)
+            proc = subprocess.run(cmd, shell=True, cwd=str(run_dir), capture_output=True, text=True, timeout=90)
             output = (proc.stdout + proc.stderr).strip()[:4000]
-            return ToolResult(success=proc.returncode == 0, output=output)
+            if proc.returncode != 0:
+                return ToolResult(success=False, output=output,
+                                  error=output or f"Tests failed (exit {proc.returncode})")
+            return ToolResult(success=True, output=output)
         except subprocess.TimeoutExpired:
             return ToolResult(success=False, output="", error="Tests timed out after 60s.")
         except Exception as exc:

@@ -35,9 +35,13 @@ Efficiency rules (CRITICAL — you have limited steps and context):
 - If a project already exists, read only the specific file you need to change, then change it.
 - Batch multiple edits: read one file, edit it, move to the next. Do not read 5 files then edit.
 - Never read CSS, JS, HTML files unless you are about to change them in the same step.
+- Never run `pip install` or `pip install -e`. The package is already installed editably.
+- On Windows, do NOT use `cd dir; command` — use full absolute paths in every command instead.
+- For bulk transformations (remove all comments, rename a symbol everywhere, reformat a whole file): use a single bash_exec with a Python one-liner instead of many file_edit calls. Example: bash_exec(cmd='python -c "import re, pathlib; p=pathlib.Path(r\'file.py\'); p.write_text(re.sub(r\'#.*\', \'\', p.read_text()))"')
 
 File editing rules:
-- Always READ a file immediately before editing it (not earlier).
+- Always READ a file immediately before editing it (not earlier). Read each file ONCE — do not re-read.
+- If a read result ends with "[N more chars — call read with offset=X]", call read again with that offset to get the rest. Do not use bash_exec to re-read the same file.
 - To change an existing file: use file_edit action='edit' with old_string/new_string (targeted).
 - To create a brand-new file: use file_edit action='create'.
 - Never use action='create' on an existing file just to make a small change — use 'edit'.
@@ -52,6 +56,13 @@ Fix tasks (when user says fix, debug, error, broken, not working):
 - If the fix does not work, diagnose again and try a different approach.
 - Never say DONE on a fix until you have confirmed it actually works.
 - If you cannot fix after 3 attempts: HELP: <explain what you tried and what's still wrong>
+
+Verification rules (CRITICAL — never hallucinate success):
+- Before running a verification command, state EXACTLY what output you expect.
+- Use bash_exec with the `expect` param to enforce the check: bash_exec(cmd="...", expect="exact string").
+- If output contains "error", "usage", "help", or is empty — the verification FAILED.
+- "No crash" is not proof of success. Only exact expected output is proof.
+- Never say DONE unless a verification command with `expect` confirmed the result.
 
 When fully done: DONE: <one SHORT sentence — no markdown, no bullet points, no headers>
 If you need user input: HELP: <question>
@@ -106,7 +117,7 @@ async def agent_loop(
     bus: EventBus | None = None,
     offline: bool = False,
     use_supervisor: bool = True,
-    max_iterations: int = 15,
+    max_iterations: int = 25,
 ) -> AgentResult:
     """
     Plan -> Act -> Observe -> Correct loop.
@@ -118,7 +129,12 @@ async def agent_loop(
         bus = EventBus()
 
     if offline:
-        return AgentResult(success=False, summary="Offline mode: LLM unavailable.")
+        from ogacode.queue import enqueue
+        task_id = enqueue(task, cwd)
+        return AgentResult(
+            success=False,
+            summary=f"Queued offline (id={task_id}). Run [bold]ogacode flush[/] when back online.",
+        )
 
     tools = _make_tools(cwd)
     schemas = [t.to_openai_schema() for t in tools]
@@ -152,7 +168,7 @@ async def agent_loop(
             content = (msg.get("content") or "").strip()
 
             if content.upper().startswith("DONE:"):
-                summary = content[5:].strip()
+                summary = content[5:].strip().split("\n\n")[0].strip()
                 if use_supervisor and files_written:
                     bus.emit(SUPERVISOR, msg="Supervisor reviewing work...")
                     approved, issue = await supervisor_review(task, summary, files_written)
@@ -207,7 +223,8 @@ async def agent_loop(
                 consecutive_failures = 0
             else:
                 consecutive_failures += 1
-                bus.emit(CORRECTION, msg=f"Tool failed ({result_tr.error}) — asking LLM to correct")
+                err_preview = (result_tr.error or "no output")[:120]
+                bus.emit(CORRECTION, msg=f"Tool failed ({err_preview}) — asking LLM to correct")
                 if consecutive_failures >= 2:
                     failed = AgentResult(
                         success=False,

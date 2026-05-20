@@ -13,6 +13,21 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "OgaCode",
+      "properties": {
+        "ogacode.serverUrl": {
+          "type": "string",
+          "default": "",
+          "description": "OgaCode server URL. When set, personal API keys are not required — the server holds them."
+        },
+        "ogacode.token": {
+          "type": "string",
+          "default": "",
+          "description": "Your OgaCode access token (required when ogacode.serverUrl is set)."
+        }
+      }
+    },
     "viewsContainers": {
       "activitybar": [
         {

@@ -5,10 +5,11 @@ let _keychainCheck: { ok: boolean; msg: string } | null = null;
 
 /**
  * Pre-flight: verify Python + keyring are reachable before spawning the runner.
- * Skipped entirely when DEEPSEEK_API_KEY or GROQ_API_KEY is already in the environment.
+ * Skipped entirely when managed server URL is configured, or when API keys are already in env.
  * Result is cached for the session so repeated calls are free.
  */
-export function checkKeychainSetup(): { ok: boolean; msg: string } {
+export function checkKeychainSetup(serverUrl?: string): { ok: boolean; msg: string } {
+  if (serverUrl) { return { ok: true, msg: '' }; }
   if (process.env['DEEPSEEK_API_KEY'] || process.env['GROQ_API_KEY']) {
     return { ok: true, msg: '' };
   }
@@ -68,22 +69,27 @@ function readKeychain(keyName: string): string {
 
 /**
  * Spawns runner.mjs which wraps the OgaCode engine SDK.
- * Passes DeepSeek/Groq API keys from the OS keychain so the runner
- * can select the right LLM provider.
+ * In managed mode (serverUrl set), passes OGACODE_SERVER_URL + OGACODE_TOKEN.
+ * In BYO mode, reads DeepSeek/Groq keys from the OS keychain.
  */
 export function runAgent(
   task: string,
   cwd: string,
   onEvent: (evt: AgentEvent) => void,
+  signal?: AbortSignal,
+  serverUrl?: string,
+  token?: string,
 ): Promise<AgentResult> {
-  // Build env with provider keys so the runner can pick the right LLM
-  const deepseekKey = readKeychain('deepseek_api_key');
-  const groqKey     = readKeychain('groq_api_key');
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    ...(deepseekKey ? { DEEPSEEK_API_KEY: deepseekKey } : {}),
-    ...(groqKey     ? { GROQ_API_KEY: groqKey }         : {}),
-  };
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (serverUrl) {
+    env['OGACODE_SERVER_URL'] = serverUrl;
+    if (token) { env['OGACODE_TOKEN'] = token; }
+  } else {
+    const deepseekKey = readKeychain('deepseek_api_key');
+    const groqKey     = readKeychain('groq_api_key');
+    if (deepseekKey) { env['DEEPSEEK_API_KEY'] = deepseekKey; }
+    if (groqKey)     { env['GROQ_API_KEY']     = groqKey; }
+  }
 
   return new Promise((resolve, reject) => {
     const proc = spawn('node', [RUNNER, task, cwd], {
@@ -91,6 +97,13 @@ export function runAgent(
       env,
       windowsHide: true,
     });
+
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        proc.kill('SIGTERM');
+        resolve({ success: false, summary: 'Interrupted by user.', files: [] });
+      }, { once: true });
+    }
 
     let buffer = '';
     let result: AgentResult = { success: false, summary: '', files: [] };

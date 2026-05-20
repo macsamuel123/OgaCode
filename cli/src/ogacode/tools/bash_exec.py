@@ -21,6 +21,7 @@ class BashExecTool(Tool):
         "type": "object",
         "properties": {
             "cmd": {"type": "string", "description": "Shell command to run"},
+            "expect": {"type": "string", "description": "Optional string that MUST appear in output. If provided and missing, the tool returns failure."},
         },
         "required": ["cmd"],
     }
@@ -28,7 +29,7 @@ class BashExecTool(Tool):
     def __init__(self, cwd: Path) -> None:
         self._cwd = cwd
 
-    def execute(self, cmd: str, **_: Any) -> ToolResult:
+    def execute(self, cmd: str, expect: str = "", **_: Any) -> ToolResult:
         first_token = cmd.strip().split()[0] if cmd.strip() else ""
         if first_token in _BANNED:
             return ToolResult(success=False, output="", error=f"'{first_token}' is blocked for safety.")
@@ -54,11 +55,13 @@ class BashExecTool(Tool):
                 timeout=30,
             )
             output = (proc.stdout + proc.stderr).strip()
-            return ToolResult(
-                success=proc.returncode == 0,
-                output=output[:4000],  # cap at 4KB to save LLM context
-                error="" if proc.returncode == 0 else f"exit code {proc.returncode}",
-            )
+            if proc.returncode != 0:
+                return ToolResult(success=False, output=output[:4000],
+                                  error=f"exit code {proc.returncode}")
+            if expect and expect not in output:
+                return ToolResult(success=False, output=output[:4000],
+                                  error=f"Expected {expect!r} in output but got: {output[:200]}")
+            return ToolResult(success=True, output=output[:4000])
         except subprocess.TimeoutExpired:
             return ToolResult(success=False, output="", error="Command timed out after 30s.")
         except Exception as exc:

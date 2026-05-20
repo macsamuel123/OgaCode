@@ -841,6 +841,58 @@ async def call_llm(
 # Routes
 # ---------------------------------------------------------------------------
 
+@app.post("/v1/chat/completions")
+async def openai_proxy(request: Request):
+    """OpenAI-compatible proxy — validates user token, forwards to DeepSeek/Groq with server key.
+
+    The runner sets OPENAI_BASE_URL to this server and OPENAI_API_KEY to the user's OgaCode token.
+    Users never need their own LLM API keys.
+    """
+    from fastapi.responses import Response as RawResponse
+
+    auth = request.headers.get("authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing OgaCode token. Set ogacode.token in VS Code settings.")
+
+    # UAT: accept any non-empty token.
+    # TODO: validate token against Supabase users table before launch.
+
+    body = await request.json()
+    streaming = body.get("stream", False)
+
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    groq_key = os.getenv("GROQ_API_KEY")
+
+    if deepseek_key:
+        target = "https://api.deepseek.com/v1/chat/completions"
+        api_key = deepseek_key
+    elif groq_key:
+        target = "https://api.groq.com/openai/v1/chat/completions"
+        api_key = groq_key
+        if body.get("model") == "deepseek-chat":
+            body["model"] = "moonshotai/kimi-k2-instruct"
+    else:
+        raise HTTPException(status_code=503, detail="No LLM provider configured on server.")
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    if streaming:
+        async def _stream():
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+                async with client.stream("POST", target, json=body, headers=headers) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+        return StreamingResponse(
+            _stream(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(target, json=body, headers=headers)
+    return RawResponse(content=resp.content, media_type="application/json", status_code=resp.status_code)
+
+
 @app.get("/health")
 async def health() -> dict:
     providers = _provider_status()

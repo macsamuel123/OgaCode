@@ -7,23 +7,26 @@ import click
 from rich.console import Console
 from rich.panel import Panel
 
+from ogacode import __version__
 from ogacode.cache import usage_stats
 from ogacode.keychain import get_api_key, set_api_key
 
 console = Console()
 
-_SUBCOMMANDS = frozenset({"setup", "doctor", "stats", "rollback"})
+_SUBCOMMANDS = frozenset({"setup", "doctor", "stats", "rollback", "config", "flush"})
 
 
 def main() -> None:
-    """Entry point: routes free-text tasks directly, subcommands through Click."""
     args = sys.argv[1:]
 
     if not args or args[0] in ("--help", "-h"):
         _print_help()
         return
 
-    # Extract flags first, then look at the remaining positional args
+    if "--version" in args or "-V" in args:
+        console.print(f"ogacode {__version__}")
+        return
+
     stream   = "--stream"  in args
     json_out = "--json"    in args
     offline  = "--offline" in args
@@ -32,12 +35,10 @@ def main() -> None:
     positional = [a for a in args if not a.startswith("-")]
     first = positional[0] if positional else None
 
-    # Known subcommand → delegate to Click group
     if not first or first in _SUBCOMMANDS:
         _cli(standalone_mode=True)
         return
 
-    # Everything else is a free-text task
     task = " ".join(positional)
     asyncio.run(_run(task, Path.cwd(), stream=stream, json_output=json_out,
                      offline=offline, plan_mode=plan))
@@ -49,8 +50,10 @@ def _print_help() -> None:
     console.print("  [cyan]ogacode setup[/]                      Configure API keys")
     console.print("  [cyan]ogacode doctor[/]                     Check provider connectivity")
     console.print("  [cyan]ogacode stats[/]                      Show data usage\n")
-    console.print("  [cyan]ogacode rollback[/]                   Restore files from last run\n")
-    console.print("Flags: --stream  --json  --offline  --plan")
+    console.print("  [cyan]ogacode rollback[/]                   Restore files from last run")
+    console.print("  [cyan]ogacode config[/]                     Set monthly data cap (MB)")
+    console.print("  [cyan]ogacode flush[/]                      Run tasks queued while offline\n")
+    console.print("Flags: --stream  --json  --offline  --plan  --version")
 
 
 async def _run(prompt: str, cwd: Path, *, stream: bool, json_output: bool,
@@ -89,13 +92,13 @@ async def _run(prompt: str, cwd: Path, *, stream: bool, json_output: bool,
                 "files": result.files_written,
             }), flush=True)
         elif result.success:
-            console.print(f"\n[bold green]Done:[/] {result.summary}")
+            console.print(f"\n[bold green]✓[/] [green]Done:[/] {result.summary}")
             for f in result.files_written:
-                console.print(f"  [dim]created:[/] {f}")
+                console.print(f"  [dim cyan]↳[/] [dim]{f}[/]")
         else:
-            console.print(f"\n[bold yellow]Warning:[/] {result.summary}")
+            console.print(f"\n[bold yellow]Warning:[/] [yellow]{result.summary}[/]")
             if result.error:
-                console.print(f"  [dim]{result.error}[/]")
+                console.print(f"  [dim]{result.error[:200]}[/]")
 
     except KeyboardInterrupt:
         if not (stream or json_output):
@@ -113,8 +116,6 @@ def _fail(msg: str, as_json: bool) -> None:
     sys.exit(1)
 
 
-# ── Subcommands ────────────────────────────────────────────────────────────────
-
 @click.group()
 def _cli() -> None:
     pass
@@ -122,7 +123,6 @@ def _cli() -> None:
 
 @_cli.command()
 def setup() -> None:
-    """Configure API keys -- stored in OS keychain, never in files."""
     console.print("[bold]OgaCode Setup[/]\n")
     for key_name, label, hint in [
         ("deepseek_api_key", "DeepSeek API key", "platform.deepseek.com -> API Keys"),
@@ -133,14 +133,18 @@ def setup() -> None:
             if not click.confirm(f"  {label} already set. Overwrite?", default=False):
                 continue
         key = click.prompt(f"  {label} ({hint})", hide_input=True)
-        if key.strip():
-            set_api_key(key_name, key.strip())
-            console.print(f"  [green]OK[/] {label} saved\n")
+        key = key.strip()
+        if not key:
+            continue
+        if len(key) < 20:
+            console.print(f"  [red]Error:[/] {label} must be at least 20 characters (got {len(key)})\n")
+            continue
+        set_api_key(key_name, key)
+        console.print(f"  [green]OK[/] {label} saved\n")
 
 
 @_cli.command()
 def doctor() -> None:
-    """Check connectivity to all LLM providers."""
     import httpx
     console.print("[bold]OgaCode Doctor[/]\n")
     for name, url, key_name in [
@@ -166,7 +170,6 @@ def doctor() -> None:
 
 @_cli.command()
 def rollback() -> None:
-    """Restore files overwritten by the last OgaCode run."""
     snap_dir = Path.cwd() / ".ogacode" / "snapshots"
     if not snap_dir.exists():
         console.print("  [dim]No snapshots found in this directory.[/]")
@@ -183,7 +186,6 @@ def rollback() -> None:
     restored = 0
     seen: set[str] = set()
     for b in backups:
-        # filename format: original_name.timestamp.bak
         parts = b.name.rsplit(".", 2)
         if len(parts) < 3:
             continue
@@ -191,7 +193,6 @@ def rollback() -> None:
         if original_name in seen:
             continue
         seen.add(original_name)
-        # Find the original file by searching the project
         candidates = list(Path.cwd().rglob(original_name))
         target = candidates[0] if candidates else Path.cwd() / original_name
         target.write_bytes(b.read_bytes())
@@ -204,7 +205,6 @@ def rollback() -> None:
 @click.option("--reset", is_flag=True)
 @click.option("--json", "json_output", is_flag=True)
 def stats(reset: bool, json_output: bool) -> None:
-    """Show data usage."""
     data = usage_stats(reset=reset)
     if json_output:
         print(json.dumps(data))
@@ -216,3 +216,78 @@ def stats(reset: bool, json_output: bool) -> None:
         console.print(f"  Tokens sent : {data['tokens_sent']:,}")
         if reset:
             console.print("\n  [dim]Counters reset.[/]")
+
+
+@_cli.command()
+@click.argument("megabytes", type=int, required=False)
+def config(megabytes: int | None) -> None:
+    import tomllib
+    from pathlib import Path
+
+    config_dir = Path.home() / ".ogacode"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "config.toml"
+
+    config: dict = {}
+    if config_path.exists():
+        raw = config_path.read_text()
+        if raw.strip():
+            config = tomllib.loads(raw)
+
+    if megabytes is None:
+        current = config.get("data_cap_mb", "not set")
+        console.print("[bold]OgaCode Config[/]\n")
+        console.print(f"  Monthly data cap: [cyan]{current}[/] MB")
+        console.print("\n  Set it with: [bold]ogacode config 500[/]")
+        return
+
+    if megabytes < 0:
+        console.print("  [red]Error:[/] Data cap must be a positive number (MB).")
+        return
+
+    config["data_cap_mb"] = megabytes
+    try:
+        import tomli_w
+        config_path.write_text(tomli_w.dumps(config))
+    except ImportError:
+        config_path.write_text(f"data_cap_mb = {megabytes}\n")
+
+    console.print(f"  [green]OK[/] Monthly data cap set to [cyan]{megabytes}[/] MB")
+    console.print(f"  Saved to: [dim]{config_path}[/]")
+
+
+@_cli.command()
+def flush() -> None:
+    """Run tasks that were queued while offline."""
+    import asyncio
+    from ogacode.queue import list_pending, mark_done
+
+    pending = list_pending()
+    if not pending:
+        console.print("  [dim]No queued tasks.[/]")
+        return
+
+    console.print(f"[bold]OgaCode Flush[/] -- {len(pending)} queued task(s)\n")
+    for t in pending:
+        console.print(f"  [dim]{t['queued_at'][:19]}[/]  [cyan]{t['task']}[/]  [dim](in {t['cwd']})[/]")
+
+    if not click.confirm(f"\n  Run all {len(pending)} task(s) now?", default=True):
+        return
+
+    from ogacode.agent.events import EventBus
+    from ogacode.agent.listeners import make_audit_listener, make_console_listener
+    from ogacode.agent.loop import agent_loop
+
+    for t in pending:
+        console.print(Panel(f"[bold cyan]OgaCode[/] -- {t['task']}", border_style="cyan", padding=(0, 1)))
+        bus = EventBus()
+        bus.on_any(make_audit_listener())
+        bus.on_any(make_console_listener(console))
+
+        result = asyncio.run(agent_loop(task=t["task"], cwd=Path(t["cwd"]), bus=bus))
+        if result.success:
+            mark_done(t["id"])
+            console.print(f"\n[bold green]✓[/] [green]Done:[/] {result.summary}\n")
+        else:
+            mark_done(t["id"], failed=True)
+            console.print(f"\n[bold red]✗[/] Failed: {result.summary}\n")
