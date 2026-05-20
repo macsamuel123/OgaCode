@@ -45,14 +45,28 @@ if (process.env.OGACODE_SERVER_URL) {
   process.env.OPENAI_MODEL = process.env.OPENAI_MODEL || 'moonshotai/kimi-k2-instruct';
 }
 
-// ── Locate the engine in global npm modules ───────────────────────────────────
-let sdkPath;
+// ── Locate (and auto-install) the engine in global npm modules ───────────────
+let globalRoot;
 try {
-  const globalRoot = execSync('npm root -g', { encoding: 'utf8', timeout: 8000 }).trim();
-  sdkPath = path.join(globalRoot, '@gitlawb', 'openclaude', 'dist', 'sdk.mjs');
+  globalRoot = execSync('npm root -g', { encoding: 'utf8', timeout: 8000 }).trim();
 } catch {
   process.stderr.write('npm not found in PATH\n');
   process.exit(1);
+}
+
+const sdkPath = path.join(globalRoot, '@gitlawb', 'openclaude', 'dist', 'sdk.mjs');
+
+// Auto-install if missing — first-run experience for testers
+import { existsSync } from 'fs';
+if (!existsSync(sdkPath)) {
+  // Emit early so the sidebar watchdog resets and shows a status message
+  process.stdout.write(JSON.stringify({ type: 'runner_started', msg: 'Installing OgaCode engine (one-time setup, ~30s)...' }) + '\n');
+  try {
+    execSync('npm install -g @gitlawb/openclaude', { encoding: 'utf8', timeout: 120000, stdio: 'pipe' });
+  } catch (e) {
+    process.stderr.write(`Failed to install OgaCode engine: ${e.message}\n`);
+    process.exit(1);
+  }
 }
 
 let query;
