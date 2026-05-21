@@ -8,7 +8,12 @@ import re
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-import openclaude_client
+try:
+    import openclaude_client
+    _GRPC_AVAILABLE = True
+except Exception:
+    openclaude_client = None  # type: ignore[assignment]
+    _GRPC_AVAILABLE = False
 
 import httpx
 from dotenv import load_dotenv
@@ -16,7 +21,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from supabase import AsyncClient, acreate_client
+try:
+    from supabase import AsyncClient, acreate_client
+    _SUPABASE_AVAILABLE = True
+except Exception:
+    _SUPABASE_AVAILABLE = False
 
 load_dotenv()
 
