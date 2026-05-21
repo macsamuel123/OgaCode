@@ -4,6 +4,7 @@ Validates user token and forwards requests to DeepSeek/Groq using server-held ke
 This is the entry point for Railway — keeps imports minimal to avoid crash loops.
 """
 import os
+print(f"[OgaCode] PORT env var = {os.getenv('PORT', 'NOT SET')}", flush=True)
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
