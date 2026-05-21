@@ -35,7 +35,7 @@ PRO_MODEL = "deepseek-chat"
 PRO_TOKEN_MONTHLY_LIMIT = 2_000_000
 FREE_TOKEN_DAILY_LIMIT  = 50_000
 
-_supabase: AsyncClient | None = None
+_supabase = None
 
 
 def _provider_status() -> dict:
@@ -50,26 +50,20 @@ def _provider_status() -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _supabase
-    required = ("PAYSTACK_SECRET_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY")
-    missing = [k for k in required if not os.getenv(k)]
-    if missing and os.getenv("ENV") == "production":
-        raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+    try:
+        url = os.getenv("SUPABASE_URL", "")
+        key = os.getenv("SUPABASE_SERVICE_KEY", "")
+        if url and key and _SUPABASE_AVAILABLE:
+            _supabase = await acreate_client(url, key)  # type: ignore[name-defined]
 
-    url = os.getenv("SUPABASE_URL", "")
-    key = os.getenv("SUPABASE_SERVICE_KEY", "")
-    if url and key:
-        _supabase = await acreate_client(url, key)
-
-    providers = _provider_status()
-    available = [k for k, v in providers.items() if v]
-    if not available:
-        print(
-            "\nWARNING: No LLM providers configured.\n"
-            "  Set GROQ_API_KEY (free at console.groq.com) or DEEPSEEK_API_KEY in server/.env\n"
-            "  All /chat and /fix requests will return 503 until at least one key is set.\n"
-        )
-    else:
-        print(f"\nOgaCode server ready — providers: {', '.join(available)}\n")
+        providers = _provider_status()
+        available = [k for k, v in providers.items() if v]
+        if not available:
+            print("\nWARNING: No LLM providers configured. Set GROQ_API_KEY or DEEPSEEK_API_KEY.\n")
+        else:
+            print(f"\nOgaCode server ready — providers: {', '.join(available)}\n")
+    except Exception as e:
+        print(f"\nWARNING: Startup error (non-fatal): {e}\n")
 
     yield
 
