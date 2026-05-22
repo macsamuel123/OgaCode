@@ -1,4 +1,9 @@
+# SECURITY NOTE: Cache data is stored UNENCRYPTED on disk at ~/.ogacode/cache/.
+# Do not cache sensitive completions on shared machines.
+# Set OGACODE_NO_CACHE=1 to disable caching entirely for sensitive sessions.
+
 import hashlib
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -6,7 +11,9 @@ from typing import Any
 import diskcache
 
 _CACHE_DIR = Path.home() / ".ogacode" / "cache"
-_STATS_KEY = "stats:v1"
+_STATS_KEY = "ogacode:stats:v1"
+
+_CACHING_DISABLED = os.getenv("OGACODE_NO_CACHE", "").strip() not in ("", "0")
 
 # 50MB cap — enough for months of responses on a constrained laptop
 _cache = diskcache.Cache(str(_CACHE_DIR), size_limit=50 * 1024 * 1024)
@@ -22,6 +29,8 @@ def cache_key(prompt: str) -> str:
 
 
 def get_cached(prompt: str) -> str | None:
+    if _CACHING_DISABLED:
+        return None
     hit = _cache.get(cache_key(prompt))
     if hit:
         _bump(cache_hit=True)
@@ -29,6 +38,8 @@ def get_cached(prompt: str) -> str | None:
 
 
 def set_cached(prompt: str, response: str, *, tokens_sent: int = 0, bytes_used: int = 0) -> None:
+    if _CACHING_DISABLED:
+        return
     _cache.set(cache_key(prompt), response, expire=86400 * 7)  # 7-day TTL
     _bump(cache_hit=False, tokens_sent=tokens_sent, bytes_used=bytes_used)
 

@@ -1,4 +1,8 @@
+# WARNING: This is NOT a security sandbox. The banned list prevents accidents,
+# not attacks. Do not run on sensitive machines without additional containerization.
+
 import platform
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -8,7 +12,27 @@ from ogacode.tools.base import Tool, ToolResult
 _IS_WINDOWS = platform.system() == "Windows"
 
 # Commands that could wipe the machine — never run regardless of LLM instruction
-_BANNED = frozenset(["rm", "rmdir", "del", "format", "mkfs", "dd", "shutdown", "reboot", "poweroff"])
+_BANNED = frozenset([
+    "rm", "rmdir", "del", "format",
+    "mkfs", "dd", "shutdown", "reboot", "poweroff", "init",
+    "curl", "wget",                         # pipe-to-shell fetch vectors
+    "kill",                                 # process killing (use specific PIDs if needed)
+    "chmod", "chown",                       # permission escalation
+])
+
+# Patterns blocked regardless of which token they appear in
+_BANNED_PATTERNS = [
+    re.compile(r":\(\)\s*\{"),             # fork bomb: :(){
+    re.compile(r"\|\s*ba?sh"),             # pipe-to-shell: curl ... | bash
+    re.compile(r"\|\s*sh\b"),              # pipe-to-shell: ... | sh
+    re.compile(r"python\s+-c\b"),          # inline python execution
+    re.compile(r"perl\s+-e\b"),            # inline perl execution
+    re.compile(r"mv\s+/\*"),               # wipe root: mv /*
+    re.compile(r"cp\s+/\*"),               # wipe root: cp /*
+    re.compile(r"chmod\s+-R\s+777"),       # world-writable recursion
+    re.compile(r"kill\s+-9"),              # SIGKILL
+    re.compile(r"\binit\s+[06]\b"),        # init 0 / init 6 (halt/reboot)
+]
 
 
 class BashExecTool(Tool):
@@ -33,6 +57,9 @@ class BashExecTool(Tool):
         first_token = cmd.strip().split()[0] if cmd.strip() else ""
         if first_token in _BANNED:
             return ToolResult(success=False, output="", error=f"'{first_token}' is blocked for safety.")
+        for pat in _BANNED_PATTERNS:
+            if pat.search(cmd):
+                return ToolResult(success=False, output="", error=f"Blocked pattern detected: {pat.pattern!r}")
         if "cd .." in cmd or "../" in cmd:
             return ToolResult(success=False, output="", error="Cannot navigate outside the project directory.")
 

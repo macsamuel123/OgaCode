@@ -56,13 +56,18 @@ const RUNNER = path.join(__dirname, '..', 'runner.mjs');
 
 /** Read a key from the Python keychain (ogacode service). Returns empty string on failure. */
 function readKeychain(keyName: string): string {
+  // Escape single quotes to prevent shell injection if keyName ever comes from user input
+  const safeKey = keyName.replace(/'/g, "'\\''");
   try {
     const out = execSync(
-      `python -c "import keyring; v=keyring.get_password('ogacode','${keyName}'); print(v or '')"`,
+      `python -c "import keyring; v=keyring.get_password('ogacode','${safeKey}'); print(v or '')"`,
       { encoding: 'utf8', timeout: 5000 }
     ).trim();
     return out;
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Surface the error so users know why the key wasn't loaded
+    console.error(`[OgaCode] keychain read failed for '${keyName}': ${msg}`);
     return '';
   }
 }

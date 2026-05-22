@@ -6,11 +6,30 @@ import httpx
 from ogacode.tools.base import Tool, ToolResult
 
 _DDG_URL = "https://html.duckduckgo.com/html/"
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; OgaCode/0.1)", "Accept-Encoding": "gzip"}
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Accept-Encoding": "gzip",
+}
+
+# Phrases that indicate an attempt to hijack the agent via search results
+_INJECTION_PATTERNS = [
+    re.compile(r"ignore\s+previous\s+instructions", re.IGNORECASE),
+    re.compile(r"system\s+prompt", re.IGNORECASE),
+    re.compile(r"disregard\s+all\s+prior", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+", re.IGNORECASE),
+    re.compile(r"new\s+instructions\s*:", re.IGNORECASE),
+]
 
 
 def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s).strip()
+
+
+def _sanitize(text: str) -> str:
+    """Remove content that looks like prompt injection from search results."""
+    for pat in _INJECTION_PATTERNS:
+        text = pat.sub("[redacted]", text)
+    return text
 
 
 class WebSearchTool(Tool):
@@ -39,7 +58,9 @@ class WebSearchTool(Tool):
             for i, (t, s) in enumerate(zip(titles, snippets)):
                 if i >= max_results:
                     break
-                lines.append(f"{i + 1}. {_strip_tags(t)}\n   {_strip_tags(s)}")
+                title   = _sanitize(_strip_tags(t))
+                snippet = _sanitize(_strip_tags(s))
+                lines.append(f"{i + 1}. {title}\n   {snippet}")
 
             return ToolResult(success=True, output="\n\n".join(lines) or "No results found.")
         except httpx.TimeoutException:

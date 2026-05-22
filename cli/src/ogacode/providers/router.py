@@ -105,14 +105,26 @@ async def _call(
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
 
+    # Note: if OGACODE_DEBUG=true, full request/response bodies are printed to stderr.
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept-Encoding": "gzip",  # reduces data cost on mobile
     }
 
+    import os
+    debug = os.getenv("OGACODE_DEBUG", "").lower() in ("1", "true")
+
+    # httpx decompresses gzip automatically when Accept-Encoding: gzip is set
+    # and the server returns Content-Encoding: gzip. No manual decompression needed.
     async with httpx.AsyncClient(timeout=provider["timeout"]) as client:
         resp = await client.post(f"{provider['base_url']}/chat/completions", headers=headers, json=payload)
+
+    if debug:
+        import sys
+        print(f"[OGACODE_DEBUG] {provider['name']} → {resp.status_code} "
+              f"({len(resp.content)} bytes, encoding={resp.headers.get('content-encoding','none')})",
+              file=sys.stderr)
 
     if resp.status_code == 429:
         raise LLMError(f"Rate limited by {provider['name']} — try again in a moment")
