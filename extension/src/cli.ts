@@ -1,4 +1,6 @@
 import { spawn, execSync } from 'child_process';
+import { writeFileSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
 import * as path from 'path';
 
 let _keychainCheck: { ok: boolean; msg: string } | null = null;
@@ -96,8 +98,12 @@ export function runAgent(
     if (groqKey)     { env['GROQ_API_KEY']     = groqKey; }
   }
 
+  // Write task to a temp file to avoid ENAMETOOLONG on long enriched prompts
+  const taskFile = path.join(tmpdir(), `ogacode-${Date.now()}.txt`);
+  writeFileSync(taskFile, task, 'utf8');
+
   return new Promise((resolve, reject) => {
-    const proc = spawn('node', [RUNNER, task, cwd], {
+    const proc = spawn('node', [RUNNER, taskFile, cwd], {
       cwd,
       env,
       windowsHide: true,
@@ -143,6 +149,7 @@ export function runAgent(
     });
 
     proc.on('close', (code) => {
+      try { unlinkSync(taskFile); } catch { /* ignore cleanup failure */ }
       if (result.summary) {
         resolve(result);
       } else if (code !== 0) {

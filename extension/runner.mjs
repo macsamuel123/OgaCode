@@ -13,15 +13,25 @@
  *   { type: "error",         msg: string }
  */
 
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
+import { readFileSync } from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
 
-const task = process.argv[2];
-const cwd  = process.argv[3];
+const taskArg = process.argv[2];
+const cwd     = process.argv[3];
 
-if (!task || !cwd) {
-  process.stderr.write('Usage: node runner.mjs "<task>" "<cwd>"\n');
+if (!taskArg || !cwd) {
+  process.stderr.write('Usage: node runner.mjs <taskFile> "<cwd>"\n');
+  process.exit(1);
+}
+
+// taskArg is a path to a temp file containing the full prompt (avoids ENAMETOOLONG)
+let task;
+try {
+  task = readFileSync(taskArg, 'utf8');
+} catch {
+  process.stderr.write(`Cannot read task file: ${taskArg}\n`);
   process.exit(1);
 }
 
