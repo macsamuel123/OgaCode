@@ -57,6 +57,16 @@ async def health() -> dict:
     }
 
 
+@app.get("/v1/models")
+async def list_models(request: Request):
+    """OpenAI-compat model list — required by the openclaude SDK on startup."""
+    _check_token(request.headers.get("authorization", ""))
+    return JSONResponse({"object": "list", "data": [
+        {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
+        {"id": "moonshotai/kimi-k2-instruct", "object": "model", "owned_by": "groq"},
+    ]})
+
+
 @app.post("/v1/chat/completions")
 async def openai_proxy(request: Request):
     _check_token(request.headers.get("authorization", ""))
