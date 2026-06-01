@@ -3,18 +3,46 @@
 Validates user token and forwards requests to DeepSeek/Groq using server-held keys.
 This is the entry point for Railway — keeps imports minimal to avoid crash loops.
 """
+import asyncio
 import os
 print(f"[OgaCode] PORT env var = {os.getenv('PORT', 'NOT SET')}", flush=True)
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+
+# ── Valid tokens (comma-separated in env) ────────────────────────────────────
+_RAW_TOKENS = os.getenv("VALID_TOKENS", "").strip()
+VALID_TOKENS: set[str] = set(t.strip() for t in _RAW_TOKENS.split(",") if t.strip())
+
+def _check_token(auth_header: str) -> None:
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing OgaCode token. Set ogacode.token in VS Code settings.")
+    if VALID_TOKENS and token not in VALID_TOKENS:
+        raise HTTPException(status_code=401, detail="Invalid OgaCode token.")
+
+# ── Request body size limit (1 MB) ───────────────────────────────────────────
+class _BodySizeLimit(BaseHTTPMiddleware):
+    _MAX = 1_000_000  # 1 MB
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > self._MAX:
+            return Response("Request body too large.", status_code=413)
+        return await call_next(request)
 
 app = FastAPI(title="OgaCode Proxy", version="1.0.0")
 
+app.add_middleware(_BodySizeLimit)
+app.add_middleware(GZipMiddleware, minimum_size=512)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://vscode.dev"],
+    allow_origin_regex=r"vscode-webview://.*|http://localhost:\d+",
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -31,10 +59,7 @@ async def health() -> dict:
 
 @app.post("/v1/chat/completions")
 async def openai_proxy(request: Request):
-    auth = request.headers.get("authorization", "")
-    token = auth.removeprefix("Bearer ").strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing OgaCode token. Set ogacode.token in VS Code settings.")
+    _check_token(request.headers.get("authorization", ""))
 
     body = await request.json()
     streaming = body.get("stream", False)
@@ -57,13 +82,31 @@ async def openai_proxy(request: Request):
 
     if streaming:
         async def _stream():
-            try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-                    async with client.stream("POST", target, json=body, headers=headers) as resp:
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-            except Exception as e:
-                yield f'data: {{"error":"{str(e)}"}}\n\ndata: [DONE]\n\n'.encode()
+            # SSE comment keepalives every 20 s prevent Railway's reverse proxy
+            # from closing the connection during slow LLM responses.
+            queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+            async def _fetch() -> None:
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+                        async with client.stream("POST", target, json=body, headers=headers) as resp:
+                            async for chunk in resp.aiter_bytes():
+                                await queue.put(chunk)
+                except Exception:
+                    await queue.put(b'data: {"error":"Service temporarily unavailable"}\n\ndata: [DONE]\n\n')
+                finally:
+                    await queue.put(None)
+
+            asyncio.create_task(_fetch())
+
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=20.0)
+                    if chunk is None:
+                        break
+                    yield chunk
+                except asyncio.TimeoutError:
+                    yield b': keepalive\n\n'  # SSE comment — invisible to clients, keeps connection alive
 
         return StreamingResponse(
             _stream(),
@@ -74,3 +117,52 @@ async def openai_proxy(request: Request):
     async with httpx.AsyncClient(timeout=90.0) as client:
         resp = await client.post(target, json=body, headers=headers)
     return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
+@app.post("/v1/vision")
+async def vision_proxy(request: Request):
+    """
+    One-shot image description endpoint — always uses Groq's vision model.
+    DeepSeek is text-only; this route is kept separate so vision never
+    touches the main LLM provider and never inflates DeepSeek costs.
+
+    Request body: { "image": "<base64 data URL>", "prompt": "optional instruction" }
+    Response:     { "description": "<text>" }
+    """
+    _check_token(request.headers.get("authorization", ""))
+
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key:
+        raise HTTPException(status_code=503, detail="Vision unavailable: no GROQ_API_KEY on server.")
+
+    body = await request.json()
+    image_url = body.get("image", "")
+    prompt = body.get("prompt", "Describe this screenshot in detail for a developer debugging a bug. Include all visible error messages, UI state, code, stack traces, and console output.")
+
+    if not image_url:
+        raise HTTPException(status_code=400, detail="Missing 'image' field (base64 data URL).")
+
+    payload = {
+        "model": "llama-3.2-11b-vision-preview",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        }],
+        "max_tokens": 800,
+    }
+    headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload, headers=headers,
+            )
+        data = resp.json()
+        description = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return JSONResponse({"description": description})
+    except Exception:
+        raise HTTPException(status_code=502, detail="Vision processing failed. Please try again.")
