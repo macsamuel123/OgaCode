@@ -53,7 +53,9 @@ class BashExecTool(Tool):
     def __init__(self, cwd: Path) -> None:
         self._cwd = cwd
 
-    def execute(self, cmd: str, expect: str = "", **_: Any) -> ToolResult:
+    def execute(self, cmd: str | None = None, expect: str = "", **_: Any) -> ToolResult:
+        if not cmd or not isinstance(cmd, str):
+            return ToolResult(success=False, output="", error="bash_exec requires a 'cmd' string argument.")
         first_token = cmd.strip().split()[0] if cmd.strip() else ""
         if first_token in _BANNED:
             return ToolResult(success=False, output="", error=f"'{first_token}' is blocked for safety.")

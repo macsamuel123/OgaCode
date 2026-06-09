@@ -27,6 +27,11 @@ async def review(task: str, summary: str, files_written: list[str]) -> tuple[boo
         return True, ""  # auto-approve rapid retries
     _last_review_time = now
 
+    from pathlib import Path
+    empty_files = [f for f in files_written if Path(f).exists() and Path(f).stat().st_size == 0]
+    if empty_files:
+        return False, f"Empty file(s): {', '.join(empty_files)}"
+
     file_list = "\n".join(f"  - {f}" for f in files_written) or "  (no files written)"
     msg = (
         f"Task: {task}\n"

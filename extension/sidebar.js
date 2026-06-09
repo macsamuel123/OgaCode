@@ -2,6 +2,23 @@
 var _jd = document.getElementById('jsdiag');
 if (_jd) { _jd.style.display = 'none'; }
 
+/* ── Onboarding ── */
+var _onboarding   = document.getElementById('onboarding');
+var _tokenInput   = document.getElementById('tokenInput');
+var _activateBtn  = document.getElementById('activateBtn');
+var _onboardErr   = document.getElementById('onboardErr');
+
+_activateBtn.addEventListener('click', function() {
+  var t = _tokenInput.value.trim();
+  if (!t) { _onboardErr.textContent = 'Please enter your access code.'; _onboardErr.style.display = 'block'; return; }
+  _activateBtn.disabled = true;
+  _activateBtn.textContent = 'Activating…';
+  api.postMessage({ command: 'saveToken', token: t });
+});
+_tokenInput.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { _activateBtn.click(); }
+});
+
 var api            = acquireVsCodeApi();
     var thread         = document.getElementById('thread');
     var inp            = document.getElementById('inp');
@@ -72,26 +89,70 @@ var api            = acquireVsCodeApi();
     function makeChatItem(c, activeId) {
       var el = document.createElement('div');
       el.className = 'hd-item' + (c.id === activeId ? ' active' : '');
-      el.innerHTML =
-        '<span class="hd-name">' + esc(c.name) + '</span>' +
-        '<span class="hd-actions">' +
-        '<button class="icon-btn" style="width:18px;height:18px;font-size:10px" title="Rename">&#9998;</button>' +
-        '<button class="icon-btn" style="width:18px;height:18px;font-size:10px" title="Delete">&#128465;</button>' +
-        '</span>';
-      el.querySelector('.hd-name').addEventListener('click', function() {
-        historyDropdown.style.display = 'none';
-        api.postMessage({ command: 'switchChat', prompt: c.id });
-      });
-      var btns = el.querySelectorAll('.icon-btn');
-      btns[0].addEventListener('click', function(e) {
-        e.stopPropagation();
-        var newName = prompt('Rename chat:', c.name);
-        if (newName && newName.trim()) { api.postMessage({ command: 'renameChat', prompt: c.id, slot: newName.trim() }); }
-      });
-      btns[1].addEventListener('click', function(e) {
-        e.stopPropagation();
-        if (confirm('Delete "' + c.name + '"?')) { api.postMessage({ command: 'deleteChat', prompt: c.id }); }
-      });
+
+      function renderNormal() {
+        el.innerHTML =
+          '<span class="hd-name">' + esc(c.name) + '</span>' +
+          '<span class="hd-actions">' +
+          '<button class="icon-btn" style="width:18px;height:18px;font-size:10px" title="Rename">&#9998;</button>' +
+          '<button class="icon-btn" style="width:18px;height:18px;font-size:10px" title="Delete">&#128465;</button>' +
+          '</span>';
+        el.querySelector('.hd-name').addEventListener('click', function() {
+          historyDropdown.style.display = 'none';
+          api.postMessage({ command: 'switchChat', prompt: c.id });
+        });
+        var btns = el.querySelectorAll('.icon-btn');
+        btns[0].addEventListener('click', function(e) { e.stopPropagation(); renderRename(); });
+        btns[1].addEventListener('click', function(e) { e.stopPropagation(); renderConfirmDelete(); });
+      }
+
+      function renderRename() {
+        el.innerHTML =
+          '<input class="hd-rename-input" value="' + esc(c.name) + '" style="flex:1;min-width:0;' +
+          'background:var(--vscode-input-background);color:var(--vscode-input-foreground);' +
+          'border:1px solid var(--vscode-input-border,#555);padding:2px 4px;font:inherit;font-size:11px;">' +
+          '<button class="icon-btn" style="width:20px;height:18px;font-size:10px" title="Save">&#10003;</button>' +
+          '<button class="icon-btn" style="width:20px;height:18px;font-size:10px" title="Cancel">&#10005;</button>';
+        var input = el.querySelector('.hd-rename-input');
+        var savebtn = el.querySelectorAll('.icon-btn')[0];
+        var cancelbtn = el.querySelectorAll('.icon-btn')[1];
+        input.focus(); input.select();
+        function doSave() {
+          var newName = input.value.trim();
+          if (newName && newName !== c.name) {
+            c.name = newName;
+            api.postMessage({ command: 'renameChat', prompt: c.id, slot: newName });
+          }
+          renderNormal();
+        }
+        savebtn.addEventListener('mousedown', function(e) { e.preventDefault(); });
+        cancelbtn.addEventListener('mousedown', function(e) { e.preventDefault(); });
+        savebtn.addEventListener('click', function(e) { e.stopPropagation(); doSave(); });
+        cancelbtn.addEventListener('click', function(e) { e.stopPropagation(); renderNormal(); });
+        input.addEventListener('blur', function() { renderNormal(); });
+        input.addEventListener('keydown', function(e) {
+          e.stopPropagation();
+          if (e.key === 'Enter') { doSave(); }
+          if (e.key === 'Escape') { renderNormal(); }
+        });
+      }
+
+      function renderConfirmDelete() {
+        el.innerHTML =
+          '<span style="flex:1;font-size:10px;opacity:.75;">Delete “' + esc(c.name.slice(0, 20)) + '”?</span>' +
+          '<button class="icon-btn" style="width:28px;height:18px;font-size:10px;color:#f88;" title="Confirm delete">Yes</button>' +
+          '<button class="icon-btn" style="width:24px;height:18px;font-size:10px;" title="Cancel">No</button>';
+        el.querySelectorAll('.icon-btn')[0].addEventListener('click', function(e) {
+          e.stopPropagation();
+          api.postMessage({ command: 'deleteChat', prompt: c.id });
+        });
+        el.querySelectorAll('.icon-btn')[1].addEventListener('click', function(e) {
+          e.stopPropagation();
+          renderNormal();
+        });
+      }
+
+      renderNormal();
       return el;
     }
 
@@ -164,9 +225,9 @@ var api            = acquireVsCodeApi();
 
     function mdToHtml(text) {
       var s = esc(text);
-      s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
+      s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
       s = s.replace(/^#{1,3} (.+)$/gm, '<b>$1</b>');
-      s = s.replace(/\\n/g, '<br>');
+      s = s.replace(/\n/g, '<br>');
       return s;
     }
 
@@ -348,6 +409,29 @@ var api            = acquireVsCodeApi();
     window.addEventListener('message', function(e) {
       var d = e.data;
 
+      if (d.command === 'showOnboarding') {
+        _onboarding.style.display = 'flex';
+        setTimeout(function() { _tokenInput.focus(); }, 100);
+        return;
+      }
+
+      if (d.command === 'onboardingDone') {
+        _onboarding.style.display = 'none';
+        _tokenInput.value = '';
+        _activateBtn.disabled = false;
+        _activateBtn.textContent = 'Activate OgaCode ➤';
+        inp.focus();
+        return;
+      }
+
+      if (d.command === 'onboardErr') {
+        _onboardErr.textContent = d.msg;
+        _onboardErr.style.display = 'block';
+        _activateBtn.disabled = false;
+        _activateBtn.textContent = 'Activate OgaCode ➤';
+        return;
+      }
+
       if (d.command === 'setProject') {
         // project name now shown per-chat in dropdown
         return;
@@ -401,7 +485,122 @@ var api            = acquireVsCodeApi();
 
       if (d.command === 'chatDeleted') {
         repopulateThread(d.turns || [], d.chatName);
+        api.postMessage({ command: 'listChats' });
         unlockSend();
+        return;
+      }
+
+      if (d.command === 'showPlan') {
+        if (currentBot) {
+          var bubble = currentBot.querySelector('.bubble');
+          var renderPlan = function(steps, summary, components, stepDetails, isDefault) {
+            var currentStepDetails = stepDetails || [];
+            var defaultBannerHtml = isDefault
+              ? '<div style="padding:6px 8px;background:rgba(255,180,0,.12);border:1px solid rgba(255,180,0,.3);' +
+                'border-radius:4px;font-size:10px;color:#e8a000;margin-bottom:8px;">' +
+                '&#9888; LLM plan unavailable — showing generic steps. Edit them before running.' +
+                '</div>'
+              : '';
+            var componentsHtml = (components && components.length > 0)
+              ? '<div style="margin:6px 0 8px;padding:6px 8px;background:rgba(255,255,255,.04);border-radius:4px">' +
+                '<div style="font-size:10px;opacity:.5;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Components</div>' +
+                components.map(function(c) {
+                  return '<span title="' + esc(c.description || '') + '" style="display:inline-block;padding:2px 8px;margin:2px;border-radius:3px;' +
+                    'font-size:10px;background:var(--vscode-badge-background,#444);color:var(--vscode-badge-foreground,#ccc);cursor:default">' +
+                    esc(c.name) + '</span>';
+                }).join('') +
+                '</div>'
+              : '';
+            var stepsInputsHtml = (steps || []).map(function(s, i) {
+              var detail = currentStepDetails[i];
+              var verifyHint = (detail && detail.verification)
+                ? '<div style="font-size:9px;opacity:.4;font-family:monospace;padding:1px 4px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(detail.verification) + '">' +
+                  '&#10003; ' + esc(detail.verification) + '</div>'
+                : '';
+              return '<div style="padding:3px 0">' +
+                '<div style="display:flex;align-items:flex-start;gap:5px">' +
+                '<span style="font-size:11px;opacity:.45;flex-shrink:0;padding-top:4px;min-width:14px">' + (i + 1) + '.</span>' +
+                '<textarea data-plan-step rows="1" style="flex:1;resize:none;overflow:hidden;' +
+                'background:var(--vscode-input-background);color:var(--vscode-input-foreground);' +
+                'border:1px solid var(--vscode-input-border,#555);padding:3px 6px;font:inherit;' +
+                'font-size:11px;border-radius:3px;line-height:1.4;">' + esc(s) + '</textarea>' +
+                '</div>' + verifyHint +
+              '</div>';
+            }).join('');
+            bubble.innerHTML =
+              defaultBannerHtml +
+              '<b style="font-size:11px;opacity:.8">Here\'s my plan — edit steps if needed</b><br>' +
+              '<span style="font-size:10px;opacity:.5">' + esc(summary || '') + '</span>' +
+              componentsHtml +
+              '<div style="margin:8px 0 4px">' + stepsInputsHtml + '</div>' +
+              '<div id="planActions" style="display:flex;gap:6px;margin-top:10px">' +
+                '<button id="planApprovebtn" style="flex:1;padding:6px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600">&#9654; Yes — run plan</button>' +
+                '<button id="planRejectbtn" style="padding:6px 10px;background:var(--vscode-button-secondaryBackground,#3a3d41);color:var(--vscode-button-secondaryForeground,#ccc);border:none;border-radius:4px;cursor:pointer;font-size:11px">&#10005; No — clarify</button>' +
+              '</div>' +
+              '<div id="clarifyBox" style="display:none;margin-top:8px">' +
+                '<textarea id="clarifyInput" rows="2" placeholder="What needs to change? e.g. use Vue instead of React, skip tests…" style="width:100%;resize:none;' +
+                'background:var(--vscode-input-background);color:var(--vscode-input-foreground);' +
+                'border:1px solid var(--vscode-input-border,#555);padding:4px 6px;font:inherit;' +
+                'font-size:11px;border-radius:3px;box-sizing:border-box;"></textarea>' +
+                '<div style="display:flex;gap:6px;margin-top:5px">' +
+                  '<button id="clarifySubmitbtn" style="flex:1;padding:5px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600">&#8635; Regenerate plan</button>' +
+                  '<button id="clarifyCancelbtn" style="padding:5px 10px;background:var(--vscode-button-secondaryBackground,#3a3d41);color:var(--vscode-button-secondaryForeground,#ccc);border:none;border-radius:4px;cursor:pointer;font-size:11px">Cancel</button>' +
+                '</div>' +
+              '</div>';
+            // Auto-resize step textareas
+            bubble.querySelectorAll('[data-plan-step]').forEach(function(ta) {
+              ta.style.height = 'auto';
+              ta.style.height = ta.scrollHeight + 'px';
+              ta.addEventListener('input', function() {
+                ta.style.height = 'auto';
+                ta.style.height = ta.scrollHeight + 'px';
+              });
+            });
+            // Yes — run plan
+            document.getElementById('planApprovebtn').addEventListener('click', function() {
+              var editedSteps = Array.from(bubble.querySelectorAll('[data-plan-step]'))
+                .map(function(ta) { return ta.value.trim(); })
+                .filter(function(s) { return s.length > 0; });
+              document.getElementById('planApprovebtn').disabled = true;
+              document.getElementById('planRejectbtn').disabled = true;
+              document.getElementById('planActions').innerHTML = '<span style="font-size:10px;opacity:.5">Running plan…</span>';
+              document.getElementById('clarifyBox').style.display = 'none';
+              stopbtn.classList.add('visible');
+              startBotMsg();
+              api.postMessage({ command: 'planApprove', steps: editedSteps, stepDetails: currentStepDetails });
+            });
+            // No — show clarification box
+            document.getElementById('planRejectbtn').addEventListener('click', function() {
+              var box = document.getElementById('clarifyBox');
+              box.style.display = box.style.display === 'none' ? 'block' : 'none';
+              if (box.style.display === 'block') {
+                document.getElementById('clarifyInput').focus();
+              }
+            });
+            // Regenerate plan with clarification
+            document.getElementById('clarifySubmitbtn').addEventListener('click', function() {
+              var text = document.getElementById('clarifyInput').value.trim();
+              document.getElementById('planApprovebtn').disabled = true;
+              document.getElementById('planRejectbtn').disabled = true;
+              document.getElementById('clarifySubmitbtn').disabled = true;
+              document.getElementById('clarifyCancelbtn').disabled = true;
+              bubble.innerHTML = '<span class="dots"><span></span><span></span><span></span></span> <span style="font-size:10px;opacity:.5">Rethinking plan…</span>';
+              api.postMessage({ command: 'planClarify', clarification: text });
+            });
+            // Cancel clarification box
+            document.getElementById('clarifyCancelbtn').addEventListener('click', function() {
+              document.getElementById('clarifyBox').style.display = 'none';
+            });
+          }
+          renderPlan(d.steps, d.summary, d.components || [], d.stepDetails || [], d.isDefault || false);
+          stopbtn.classList.remove('visible');
+        }
+        return;
+      }
+
+      if (d.command === 'showPlanUpdate') {
+        // Re-render plan in the same bot bubble after clarification regeneration
+        window.dispatchEvent(new MessageEvent('message', { data: { command: 'showPlan', steps: d.steps, summary: d.summary, components: d.components || [], stepDetails: d.stepDetails || [], isDefault: d.isDefault || false } }));
         return;
       }
 
@@ -523,12 +722,8 @@ var api            = acquireVsCodeApi();
         if (d.file && d.file.content) {
           var existing = inp.value.trim();
           inp.value = existing
-            ? existing + '
-
-[Attached file: ' + d.file.name + ']
-' + d.file.content
-            : '[Attached file: ' + d.file.name + ']
-' + d.file.content;
+            ? existing + '\n\n[Attached file: ' + d.file.name + ']\n' + d.file.content
+            : '[Attached file: ' + d.file.name + ']\n' + d.file.content;
           inp.dispatchEvent(new Event('input'));
         }
         return;

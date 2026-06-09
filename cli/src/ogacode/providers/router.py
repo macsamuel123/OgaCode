@@ -1,37 +1,10 @@
+import asyncio
 import json
-import time
-from typing import Any, Callable
+import os
 
 import httpx
 
 from ogacode.cache import get_cached, set_cached
-from ogacode.keychain import get_api_key
-
-_PROVIDERS = [
-    {
-        "name": "deepseek",
-        "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
-        "key_name": "deepseek_api_key",
-        "timeout": 60,
-    },
-    {
-        "name": "groq",
-        "base_url": "https://api.groq.com/openai/v1",
-        "model": "qwen/qwen3-32b",
-        "key_name": "groq_api_key",
-        "timeout": 30,
-    },
-    {
-        "name": "ollama",
-        "base_url": "http://localhost:11434/v1",
-        "model": "qwen2.5-coder:7b",
-        "key_name": None,  # no auth needed for local Ollama
-        "timeout": 30,
-    },
-]
-
-_backoff: dict[str, float] = {}
 
 
 class LLMError(Exception):
@@ -46,13 +19,18 @@ async def call_llm(
     messages: list[dict],
     tools: list[dict] | None = None,
     *,
-    on_provider: Callable[[str], None] | None = None,
+    on_provider=None,
 ) -> dict:
-    """Call LLM with automatic fallback: DeepSeek → Groq → Ollama.
+    """Call the OgaCode managed server. Requires OGACODE_SERVER_URL + OGACODE_TOKEN."""
+    server_url = os.getenv("OGACODE_SERVER_URL", "").rstrip("/")
+    token = os.getenv("OGACODE_TOKEN", "")
 
-    Caches simple single-turn completions to save data. Gzips all payloads.
-    """
-    # Semantic cache: only for simple user→assistant turns with no tools
+    if not server_url or not token:
+        raise AllProvidersFailedError(
+            "OgaCode token not configured. Add it in VS Code settings (ogacode.token)."
+        )
+
+    # Semantic cache: only for simple single-turn completions with no tools
     cache_prompt: str | None = None
     if not tools and len(messages) == 2 and messages[1]["role"] == "user":
         cache_prompt = messages[1]["content"]
@@ -60,19 +38,54 @@ async def call_llm(
         if cached:
             return {"choices": [{"message": {"role": "assistant", "content": cached}, "finish_reason": "stop"}]}
 
-    last_err: Exception | None = None
+    if on_provider:
+        on_provider("ogacode")
 
-    for provider in _PROVIDERS:
-        key_name = provider["key_name"]
-        api_key = get_api_key(key_name) if key_name else "ollama"
-        if key_name and not api_key:
-            continue  # skip unconfigured cloud providers
+    payload: dict = {
+        "model": "deepseek-chat",
+        "messages": messages,
+        "temperature": 0.1,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
 
-        if on_provider:
-            on_provider(provider["name"])
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept-Encoding": "gzip",
+    }
 
+    debug = os.getenv("OGACODE_DEBUG", "").lower() in ("1", "true")
+
+    last_error: Exception | None = None
+    for attempt in range(3):
         try:
-            result = await _call(provider, api_key or "ollama", messages, tools)
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(f"{server_url}/v1/chat/completions", headers=headers, json=payload)
+
+            if debug:
+                import sys
+                print(f"[OGACODE_DEBUG] → {resp.status_code} "
+                      f"({len(resp.content)} bytes, encoding={resp.headers.get('content-encoding', 'none')})",
+                      file=sys.stderr)
+
+            if resp.status_code == 401:
+                raise AllProvidersFailedError("Invalid OgaCode token. Check your token in VS Code settings (ogacode.token).")
+            if resp.status_code == 429:
+                raise AllProvidersFailedError("Usage limit reached. Upgrade your plan at ogacode.dev.")
+
+            # 502/503/504 are transient — retry with backoff
+            if resp.status_code in (502, 503, 504):
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)   # 1s, 2s
+                    continue
+                raise AllProvidersFailedError(f"Server error {resp.status_code}: {resp.text[:200]}")
+
+            if not resp.is_success:
+                raise AllProvidersFailedError(f"Server error {resp.status_code}: {resp.text[:200]}")
+
+            result = resp.json()
 
             if cache_prompt:
                 content = result["choices"][0]["message"].get("content", "")
@@ -80,66 +93,15 @@ async def call_llm(
 
             return result
 
-        except (httpx.TimeoutException, LLMError) as exc:
-            last_err = exc
-            await _backoff_wait(provider["name"])
+        except httpx.TimeoutException as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise AllProvidersFailedError("OgaCode server timed out. Check your connection.") from exc
+        except AllProvidersFailedError:
+            raise
+        except Exception as exc:
+            raise AllProvidersFailedError(f"Connection error: {exc}") from exc
 
-    detail = f" ({type(last_err).__name__}: {last_err})" if last_err else ""
-    raise AllProvidersFailedError(
-        f"All LLM providers failed.{detail}"
-    ) from last_err
-
-
-async def _call(
-    provider: dict[str, Any],
-    api_key: str,
-    messages: list[dict],
-    tools: list[dict] | None,
-) -> dict:
-    payload: dict[str, Any] = {
-        "model": provider["model"],
-        "messages": messages,
-        "temperature": 0.1,  # low = deterministic code, less hallucination
-    }
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-
-    # Note: if OGACODE_DEBUG=true, full request/response bodies are printed to stderr.
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept-Encoding": "gzip",  # reduces data cost on mobile
-    }
-
-    import os
-    debug = os.getenv("OGACODE_DEBUG", "").lower() in ("1", "true")
-
-    # httpx decompresses gzip automatically when Accept-Encoding: gzip is set
-    # and the server returns Content-Encoding: gzip. No manual decompression needed.
-    async with httpx.AsyncClient(timeout=provider["timeout"]) as client:
-        resp = await client.post(f"{provider['base_url']}/chat/completions", headers=headers, json=payload)
-
-    if debug:
-        import sys
-        print(f"[OGACODE_DEBUG] {provider['name']} → {resp.status_code} "
-              f"({len(resp.content)} bytes, encoding={resp.headers.get('content-encoding','none')})",
-              file=sys.stderr)
-
-    if resp.status_code == 429:
-        raise LLMError(f"Rate limited by {provider['name']} — try again in a moment")
-    if not resp.is_success:
-        raise LLMError(f"{provider['name']} returned HTTP {resp.status_code}: {resp.text[:200]}")
-
-    return resp.json()
-
-
-async def _backoff_wait(provider_name: str) -> None:
-    import asyncio
-    attempts_key = f"{provider_name}:attempts"
-    attempts = int(_backoff.get(attempts_key, 0))
-    # 2s → 5s → 10s
-    wait = min(2.0 * (2 ** attempts), 10.0)
-    _backoff[attempts_key] = attempts + 1
-    _backoff[provider_name] = time.time()
-    await asyncio.sleep(wait)
+    raise AllProvidersFailedError(f"Connection error: {last_error}")

@@ -5,11 +5,10 @@
   "version": "0.0.1",
   "publisher": "ogacode",
   "engines": { "vscode": "^1.85.0" },
+  "icon": "icon.png",
   "categories": ["Other"],
   "activationEvents": [
-    "onLanguage:typescript",
-    "onLanguage:javascript",
-    "onLanguage:python"
+    "onStartupFinished"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -56,7 +55,8 @@
     "build:prod": "node esbuild.cjs --production",
     "watch": "node esbuild.cjs --watch",
     "typecheck": "tsc --noEmit",
-    "package": "node esbuild.cjs --production && npx @vscode/vsce package --no-dependencies"
+    "validate": "node scripts/validate.cjs",
+    "package": "node scripts/validate.cjs && node esbuild.cjs --production && npx @vscode/vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

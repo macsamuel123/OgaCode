@@ -6,15 +6,10 @@ import * as path from 'path';
 let _keychainCheck: { ok: boolean; msg: string } | null = null;
 
 /**
- * Pre-flight: verify Python + keyring are reachable before spawning the runner.
- * Skipped entirely when managed server URL is configured, or when API keys are already in env.
+ * Pre-flight: verify Python + ogacode package are reachable before spawning.
  * Result is cached for the session so repeated calls are free.
  */
-export function checkKeychainSetup(serverUrl?: string): { ok: boolean; msg: string } {
-  if (serverUrl) { return { ok: true, msg: '' }; }
-  if (process.env['DEEPSEEK_API_KEY'] || process.env['GROQ_API_KEY']) {
-    return { ok: true, msg: '' };
-  }
+export function checkKeychainSetup(): { ok: boolean; msg: string } {
   if (_keychainCheck !== null) { return _keychainCheck; }
 
   try {
@@ -22,7 +17,17 @@ export function checkKeychainSetup(serverUrl?: string): { ok: boolean; msg: stri
   } catch {
     _keychainCheck = {
       ok: false,
-      msg: 'Python not found in PATH. Install Python and run "ogacode setup" to store your API key, or set DEEPSEEK_API_KEY / GROQ_API_KEY in your environment.',
+      msg: 'Python not found in PATH. Install Python 3.10+ and run "pip install -e path/to/ogacode/cli".',
+    };
+    return _keychainCheck;
+  }
+
+  try {
+    execSync('python -c "import ogacode"', { timeout: 5000, stdio: 'pipe' });
+  } catch {
+    _keychainCheck = {
+      ok: false,
+      msg: 'OgaCode Python package not found. Run: pip install -e "C:\\Users\\User\\OgaCode\\cli"',
     };
     return _keychainCheck;
   }
@@ -52,13 +57,92 @@ export interface AgentResult {
   files: string[];
 }
 
-// runner.mjs lives next to this file's compiled output (dist/)
-// __dirname = extension/dist at runtime
-const RUNNER = path.join(__dirname, '..', 'runner.mjs');
+export interface PlanComponent {
+  name: string;
+  files: string[];
+  dependencies: string[];
+  description: string;
+}
+
+export interface PlanStepDetail {
+  action: string;
+  files: string[];
+  verification: string;
+}
+
+export interface PlanResult {
+  summary: string;
+  steps: string[];
+  components: PlanComponent[];
+  stepDetails: PlanStepDetail[];
+  isDefault: boolean;
+}
+
+/**
+ * Generates a plan for the task without executing it.
+ * Returns null on failure so callers can fall through to direct execution.
+ */
+export function getPlan(
+  task: string,
+  cwd: string,
+  serverUrl?: string,
+  token?: string,
+): Promise<PlanResult | null> {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (serverUrl) { env['OGACODE_SERVER_URL'] = serverUrl; }
+  if (token)     { env['OGACODE_TOKEN']      = token; }
+
+  const taskFile = path.join(tmpdir(), `ogacode-plan-${Date.now()}.txt`);
+  writeFileSync(taskFile, task, 'utf8');
+
+  return new Promise((resolve) => {
+    const proc = spawn(
+      'python', ['-m', 'ogacode.cli', '--plan-only', '--task-file', taskFile],
+      { cwd, env, windowsHide: true },
+    );
+
+    const timeout = setTimeout(() => { proc.kill(); resolve(null); }, 60000);
+    let buffer = '';
+    let stderrBuf = '';
+
+    proc.stdout.on('data', (chunk: Buffer) => { buffer += chunk.toString('utf8'); });
+    proc.stderr.on('data', (chunk: Buffer) => { stderrBuf += chunk.toString('utf8'); });
+
+    proc.on('close', () => {
+      clearTimeout(timeout);
+      try { unlinkSync(taskFile); } catch { /* ignore */ }
+      if (stderrBuf.trim()) {
+        console.error('[OgaCode getPlan] stderr:', stderrBuf.trim().slice(0, 500));
+      }
+      for (const line of buffer.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) { continue; }
+        try {
+          const evt = JSON.parse(trimmed) as {
+            type: string; summary?: string; steps?: string[];
+            components?: PlanComponent[]; step_details?: PlanStepDetail[]; is_default?: boolean;
+          };
+          if (evt.type === 'plan' && evt.summary && evt.steps) {
+            resolve({
+              summary: evt.summary,
+              steps: evt.steps,
+              components: evt.components ?? [],
+              stepDetails: evt.step_details ?? [],
+              isDefault: evt.is_default ?? false,
+            });
+            return;
+          }
+        } catch { /* skip non-JSON */ }
+      }
+      resolve(null);
+    });
+
+    proc.on('error', () => { clearTimeout(timeout); resolve(null); });
+  });
+}
 
 /** Read a key from the Python keychain (ogacode service). Returns empty string on failure. */
-function readKeychain(keyName: string): string {
-  // Escape single quotes to prevent shell injection if keyName ever comes from user input
+export function readKeychain(keyName: string): string {
   const safeKey = keyName.replace(/'/g, "'\\''");
   try {
     const out = execSync(
@@ -68,16 +152,14 @@ function readKeychain(keyName: string): string {
     return out;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Surface the error so users know why the key wasn't loaded
     console.error(`[OgaCode] keychain read failed for '${keyName}': ${msg}`);
     return '';
   }
 }
 
 /**
- * Spawns runner.mjs which wraps the OgaCode engine SDK.
- * In managed mode (serverUrl set), passes OGACODE_SERVER_URL + OGACODE_TOKEN.
- * In BYO mode, reads DeepSeek/Groq keys from the OS keychain.
+ * Spawns the OgaCode Python CLI as a subprocess.
+ * Passes OGACODE_SERVER_URL + OGACODE_TOKEN so the CLI routes through the managed server.
  */
 export function runAgent(
   task: string,
@@ -88,26 +170,18 @@ export function runAgent(
   token?: string,
 ): Promise<AgentResult> {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  if (serverUrl) {
-    env['OGACODE_SERVER_URL'] = serverUrl;
-    if (token) { env['OGACODE_TOKEN'] = token; }
-  } else {
-    const deepseekKey = readKeychain('deepseek_api_key');
-    const groqKey     = readKeychain('groq_api_key');
-    if (deepseekKey) { env['DEEPSEEK_API_KEY'] = deepseekKey; }
-    if (groqKey)     { env['GROQ_API_KEY']     = groqKey; }
-  }
+  if (serverUrl) { env['OGACODE_SERVER_URL'] = serverUrl; }
+  if (token)     { env['OGACODE_TOKEN']      = token; }
 
-  // Write task to a temp file to avoid ENAMETOOLONG on long enriched prompts
+  // Write task to a temp file to avoid OS arg length limits on long enriched prompts
   const taskFile = path.join(tmpdir(), `ogacode-${Date.now()}.txt`);
   writeFileSync(taskFile, task, 'utf8');
 
   return new Promise((resolve, reject) => {
-    const proc = spawn('node', [RUNNER, taskFile, cwd], {
-      cwd,
-      env,
-      windowsHide: true,
-    });
+    const proc = spawn(
+      'python', ['-m', 'ogacode.cli', '--stream', '--task-file', taskFile],
+      { cwd, env, windowsHide: true },
+    );
 
     if (signal) {
       signal.addEventListener('abort', () => {
@@ -117,6 +191,7 @@ export function runAgent(
     }
 
     let buffer = '';
+    let stderrLog = '';
     let result: AgentResult = { success: false, summary: '', files: [] };
 
     proc.stdout.on('data', (chunk: Buffer) => {
@@ -139,13 +214,16 @@ export function runAgent(
           } else {
             onEvent(evt);
           }
-        } catch { /* non-JSON line, skip */ }
+        } catch { /* non-JSON line from Python startup, skip */ }
       }
     });
 
     proc.stderr.on('data', (chunk: Buffer) => {
       const msg = chunk.toString('utf8').trim();
-      if (msg) { onEvent({ type: 'correction', msg }); }
+      if (msg) {
+        stderrLog += msg + '\n';
+        onEvent({ type: 'correction', msg });
+      }
     });
 
     proc.on('close', (code) => {
@@ -153,7 +231,9 @@ export function runAgent(
       if (result.summary) {
         resolve(result);
       } else if (code !== 0) {
-        reject(new Error(`OgaCode engine exited with code ${code ?? '?'}. See ONBOARDING.md for setup steps.`));
+        const detail = stderrLog.trim().slice(0, 300);
+        const hint = detail ? `\n\nDetails: ${detail}` : ' Run "pip install -e C:\\Users\\User\\OgaCode\\cli" to install OgaCode.';
+        reject(new Error(`OgaCode exited with code ${code ?? '?'}.${hint}`));
       } else {
         resolve(result);
       }
@@ -161,7 +241,7 @@ export function runAgent(
 
     proc.on('error', () => {
       reject(new Error(
-        'Cannot start Node.js. Make sure Node.js is installed and in PATH.'
+        'Cannot start Python. Make sure Python 3.10+ is installed and in PATH.'
       ));
     });
   });

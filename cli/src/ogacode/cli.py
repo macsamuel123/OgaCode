@@ -11,9 +11,15 @@ from ogacode import __version__
 from ogacode.cache import usage_stats
 from ogacode.keychain import get_api_key, set_api_key
 
+# Windows terminals default to cp1252 which can't encode the Unicode symbols
+# used by Rich (▸, ✗, ↺, etc.). Force UTF-8 so they render correctly.
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 console = Console()
 
-_SUBCOMMANDS = frozenset({"setup", "doctor", "stats", "rollback", "config", "flush"})
+_SUBCOMMANDS = frozenset({"setup", "doctor", "stats", "rollback", "config", "flush", "memory", "rag"})
 
 
 def main() -> None:
@@ -31,6 +37,31 @@ def main() -> None:
     json_out = "--json"    in args
     offline  = "--offline" in args
     plan     = "--plan"    in args
+
+    # --task-file <path>: read task from a file (used by VS Code extension for long tasks)
+    if '--task-file' in args:
+        idx = args.index('--task-file')
+        if idx + 1 < len(args):
+            task = Path(args[idx + 1]).read_text(encoding='utf-8').strip()
+
+            # --plan-only: generate plan, emit JSON, exit — no agent execution
+            if '--plan-only' in args:
+                import dataclasses
+                from ogacode.agent.loop import create_plan_with_fallback
+                p = asyncio.run(create_plan_with_fallback(task))
+                print(json.dumps({
+                    "type": "plan",
+                    "summary": p.summary,
+                    "steps": p.steps,
+                    "components": [dataclasses.asdict(c) for c in p.components],
+                    "step_details": [dataclasses.asdict(s) for s in p.step_details],
+                    "is_default": p.is_default,
+                }), flush=True)
+                return
+
+            asyncio.run(_run(task, Path.cwd(), stream=stream, json_output=json_out,
+                             offline=offline, plan_mode=plan))
+            return
 
     positional = [a for a in args if not a.startswith("-")]
     first = positional[0] if positional else None
@@ -52,7 +83,11 @@ def _print_help() -> None:
     console.print("  [cyan]ogacode stats[/]                      Show data usage\n")
     console.print("  [cyan]ogacode rollback[/]                   Restore files from last run")
     console.print("  [cyan]ogacode config[/]                     Set monthly data cap (MB)")
-    console.print("  [cyan]ogacode flush[/]                      Run tasks queued while offline\n")
+    console.print("  [cyan]ogacode flush[/]                      Run tasks queued while offline")
+    console.print("  [cyan]ogacode memory show[/]                Show project memory")
+    console.print("  [cyan]ogacode memory set KEY VALUE[/]       Store a project fact")
+    console.print("  [cyan]ogacode memory clear[/]               Wipe all memory for this project")
+    console.print("  [cyan]ogacode rag status[/]                 Show RAG index stats for this project\n")
     console.print("Flags: --stream  --json  --offline  --plan  --version")
 
 
@@ -256,6 +291,120 @@ def config(megabytes: int | None) -> None:
     console.print(f"  Saved to: [dim]{config_path}[/]")
 
 
+@_cli.group()
+def memory() -> None:
+    """Manage per-project memory (stored in ~/.ogacode/projects/)."""
+    pass
+
+
+@memory.command("show")
+@click.option("--json", "json_output", is_flag=True)
+def memory_show(json_output: bool) -> None:
+    """Show all facts and recent task history for the current project."""
+    from ogacode import memory as pm
+    cwd = Path.cwd()
+    facts = pm.get_facts(cwd)
+    log   = pm.get_task_log(cwd, limit=10)
+
+    if json_output:
+        print(json.dumps({"facts": facts, "task_log": log}))
+        return
+
+    console.print(f"[bold]Project Memory[/]  [dim]{cwd}[/]\n")
+    if facts:
+        console.print("[bold cyan]Facts[/]")
+        by_cat: dict[str, list] = {}
+        for f in facts:
+            by_cat.setdefault(f["category"], []).append(f)
+        for cat, items in by_cat.items():
+            console.print(f"  [dim]{cat}[/]")
+            for item in items:
+                console.print(f"    [cyan]{item['key']}[/]: {item['value']}")
+    else:
+        console.print("  [dim]No facts stored yet.[/]")
+
+    console.print()
+    if log:
+        console.print("[bold cyan]Recent Tasks[/]")
+        for t in log:
+            import datetime
+            ts = datetime.datetime.fromtimestamp(t["logged_at"]).strftime("%Y-%m-%d %H:%M")
+            console.print(f"  [dim]{ts}[/] {t['task'][:70]}")
+            console.print(f"      [dim]→ {t['summary'][:90]}[/]")
+    else:
+        console.print("  [dim]No task history yet.[/]")
+
+
+@memory.command("set")
+@click.argument("key")
+@click.argument("value")
+@click.option("--category", "-c", default="general", show_default=True)
+def memory_set(key: str, value: str, category: str) -> None:
+    """Store a fact about this project."""
+    from ogacode import memory as pm
+    pm.set_fact(Path.cwd(), key, value, category)
+    console.print(f"  [green]OK[/] [cyan]{key}[/] = {value}  [dim]({category})[/]")
+
+
+@memory.command("delete")
+@click.argument("key")
+def memory_delete(key: str) -> None:
+    """Remove a single fact by key."""
+    from ogacode import memory as pm
+    deleted = pm.delete_fact(Path.cwd(), key)
+    if deleted:
+        console.print(f"  [green]OK[/] Deleted [cyan]{key}[/]")
+    else:
+        console.print(f"  [yellow]Not found:[/] [cyan]{key}[/]")
+
+
+@memory.command("clear")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
+def memory_clear(yes: bool) -> None:
+    """Wipe ALL memory (facts + task history) for the current project."""
+    from ogacode import memory as pm
+    cwd = Path.cwd()
+    if not yes and not click.confirm(f"  Wipe all memory for {cwd}?", default=False):
+        console.print("  [dim]Cancelled.[/]")
+        return
+    pm.clear(cwd)
+    console.print("  [green]OK[/] Project memory cleared.")
+
+
+@_cli.group()
+def rag() -> None:
+    """Manage the optional code RAG index (requires Ollama + nomic-embed-text)."""
+    pass
+
+
+@rag.command("status")
+@click.option("--json", "json_output", is_flag=True)
+def rag_status(json_output: bool) -> None:
+    """Show how many files are indexed and whether Ollama is available."""
+    import datetime
+    from ogacode import rag as r
+    data = r.status(Path.cwd())
+    if json_output:
+        print(json.dumps(data))
+        return
+    console.print("[bold]OgaCode RAG Status[/]\n")
+    avail = "[green]yes[/]" if data["ollama_available"] else "[dim]no  (RAG disabled)[/]"
+    console.print(f"  Ollama + model  : {avail}")
+    console.print(f"  Embed model     : {data['embed_model']}  ({data['embed_model_mb']} MB)")
+    console.print(f"  Files indexed   : {data['files_indexed']}")
+    console.print(f"  Chunks indexed  : {data['chunks_indexed']}")
+    if data["last_indexed_at"]:
+        ts = datetime.datetime.fromtimestamp(data["last_indexed_at"]).strftime("%Y-%m-%d %H:%M:%S")
+        console.print(f"  Last indexed    : {ts}")
+    else:
+        console.print("  Last indexed    : [dim]never[/]")
+    if not data["ollama_available"]:
+        console.print(
+            "\n  To enable RAG: [bold]ollama pull nomic-embed-text[/]"
+            "\n  Then keep Ollama running while using OgaCode."
+        )
+
+
 @_cli.command()
 def flush() -> None:
     """Run tasks that were queued while offline."""
@@ -291,3 +440,7 @@ def flush() -> None:
         else:
             mark_done(t["id"], failed=True)
             console.print(f"\n[bold red]✗[/] Failed: {result.summary}\n")
+
+
+if __name__ == '__main__':
+    main()

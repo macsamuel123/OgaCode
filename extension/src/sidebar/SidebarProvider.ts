@@ -1,29 +1,13 @@
 import * as vscode from 'vscode';
 import { exec } from 'child_process';
-import { runAgent, AgentEvent, checkKeychainSetup } from '../cli';
-import { getNonce } from '../utils/nonce';
-import { PreviewPanel } from '../preview/PreviewPanel';
-
-interface Turn {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-interface Memory {
-  prd: string;
-  rules: string;
-  skills: string;
-}
-
-interface Chat {
-  id: string;
-  name: string;
-  project: string;
-  projectPath: string;
-  createdAt: string;
-  updatedAt: string;
-  turns: Turn[];
-}
+import { runAgent, AgentEvent, checkKeychainSetup, readKeychain, getPlan, PlanComponent, PlanStepDetail } from '../cli';
+import { PreviewPanel, ElementSelection } from '../preview/PreviewPanel';
+import { Turn, Memory, Chat } from './types';
+import { getSidebarHtml } from './getSidebarHtml';
+import { enrichPrompt } from './enrichPrompt';
+import { describeImage } from './describeImage';
+import { autoReview } from './review';
+import { deployToNetlify } from './deploy';
 
 const CHATS_KEY = 'ogacode.chats.v2';
 const ACTIVE_CHAT_KEY = 'ogacode.activeChatId';
@@ -32,28 +16,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   private _lastPreviewFile: string | undefined;
   private _abortController: AbortController | undefined;
+  private _selectedElement: ElementSelection | undefined;
+  private _previewSelectionDisposable: vscode.Disposable | undefined;
+  private _isAgentRunning = false;
+  private _pendingPlan: { enriched: string; userTurn: Turn; chatId: string; history: Turn[]; cwd: string; serverUrl: string; token: string } | undefined;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
     private readonly _ctx: vscode.ExtensionContext,
   ) {}
-
-  private _sessionKey(): string {
-    const cwd = this._getCwd();
-    return cwd ? `ogacode.session.${cwd}` : 'ogacode.session.__global';
-  }
-
-  private _getHistory(): Turn[] {
-    return this._ctx.globalState.get<Turn[]>(this._sessionKey()) ?? [];
-  }
-
-  private async _setHistory(turns: Turn[]): Promise<void> {
-    await this._ctx.globalState.update(this._sessionKey(), turns.slice(-20));
-  }
-
-  private async _clearHistory(): Promise<void> {
-    await this._ctx.globalState.update(this._sessionKey(), []);
-  }
 
   private _memoryKey(): string {
     const cwd = this._getCwd();
@@ -74,7 +45,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       enableScripts: true,
       localResourceRoots: [this._extensionUri],
     };
-    webviewView.webview.html = this._getHtml(webviewView.webview);
+    webviewView.webview.html = getSidebarHtml(webviewView.webview, this._extensionUri);
     webviewView.webview.onDidReceiveMessage(this._handleMessage.bind(this));
     // Restore the last active chat so thread + historyBtn are correct on reload
     setTimeout(() => {
@@ -85,62 +56,38 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         this._send('chatNamed', { id: chat.id, name: chat.name });
       }
     }, 200);
+
+    // Show onboarding if managed mode is configured but no token is set yet
+    const cfg2 = vscode.workspace.getConfiguration('ogacode');
+    const hasServerUrl = cfg2.get<string>('serverUrl', '').trim().length > 0;
+    const hasToken     = cfg2.get<string>('token', '').trim().length > 0;
+    if (hasServerUrl && !hasToken) {
+      this._send('showOnboarding', {});
+    }
+
+    // Re-enable send button and focus input when sidebar becomes visible.
+    // The WebviewView HTML persists across hide/show (retainContextWhenHidden: true),
+    // so a button stuck disabled from a crashed agent stays broken without this.
+    webviewView.onDidChangeVisibility(() => {
+      if (webviewView.visible) {
+        if (!this._isAgentRunning) { this._send('unlockSend', {}); }
+        this._send('focusInput', {});
+      }
+    });
+
+    // Subscribe to element clicks from the PreviewPanel
+    this._previewSelectionDisposable?.dispose();
+    this._previewSelectionDisposable = PreviewPanel.onElementSelected((data) => {
+      this._selectedElement = data;
+      const label = data.classes
+        ? `${data.tagName}.${data.classes.trim().split(/\s+/)[0]}`
+        : data.tagName;
+      this._send('elementSelected', { label, selector: data.selector });
+    });
   }
 
   private _getCwd(): string {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
-  }
-
-  private _readKeychain(keyName: string): string {
-    try {
-      const { execSync } = require('child_process') as typeof import('child_process');
-      return execSync(
-        `python -c "import keyring; v=keyring.get_password('ogacode','${keyName}'); print(v or '')"`,
-        { encoding: 'utf8', timeout: 5000 }
-      ).trim();
-    } catch { return ''; }
-  }
-
-  private async _describeImage(dataUrl: string): Promise<string> {
-    const groqKey = this._readKeychain('groq_api_key');
-    if (!groqKey) { return ''; }
-    const body = JSON.stringify({
-      model: 'llama-3.2-11b-vision-preview',
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: 'Describe this screenshot in detail for a developer debugging a bug. Include all visible: error messages, UI state, code, stack traces, console output, and any other relevant details.' },
-          { type: 'image_url', image_url: { url: dataUrl } },
-        ],
-      }],
-      max_tokens: 800,
-    });
-    return new Promise((resolve) => {
-      const https = require('https') as typeof import('https');
-      const req = https.request({
-        hostname: 'api.groq.com',
-        path: '/openai/v1/chat/completions',
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${groqKey}`,
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      }, (res) => {
-        let data = '';
-        res.on('data', (chunk: Buffer) => { data += chunk; });
-        res.on('end', () => {
-          try {
-            const json = JSON.parse(data) as { choices?: Array<{ message?: { content?: string } }> };
-            resolve(json.choices?.[0]?.message?.content ?? '');
-          } catch { resolve(''); }
-        });
-      });
-      req.on('error', () => resolve(''));
-      req.setTimeout(15000, () => { req.destroy(); resolve(''); });
-      req.write(body);
-      req.end();
-    });
   }
 
   private async _handleMessage(message: {
@@ -155,6 +102,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     prd?: string;
     rules?: string;
     skills?: string;
+    steps?: string[];
+    stepDetails?: PlanStepDetail[];
   }): Promise<void> {
 
     // ── Run agent task ────────────────────────────────────────────────────────
@@ -169,92 +118,144 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       const serverUrl = cfg.get<string>('serverUrl', '').trim();
       const token     = cfg.get<string>('token', '').trim();
 
-      const preflight = checkKeychainSetup(serverUrl || undefined);
+      const preflight = checkKeychainSetup();
       if (!preflight.ok) {
         this._send('chatError', { msg: `Setup required: ${preflight.msg}` });
         return;
       }
 
       this._abortController = new AbortController();
+      this._isAgentRunning = true;
       try {
         const activeChat = await this._ensureActiveChat();
         const history = activeChat.turns;
         let userPrompt = message.prompt;
+
+        // Inject selected element context so agent edits exactly the right element
+        if (this._selectedElement) {
+          const el = this._selectedElement;
+          userPrompt =
+            `[ELEMENT SELECTED FOR EDITING]\n` +
+            `The user clicked this specific element in the preview. Edit ONLY this element — do not change anything else.\n` +
+            `CSS Selector: ${el.selector}\n` +
+            `HTML: ${el.outerHtml}\n` +
+            `[END ELEMENT]\n\n${userPrompt}`;
+          this._selectedElement = undefined;
+        }
+
         if (message.image) {
-          this._send('agentEvent', { type: 'thinking', step: 0, msg: 'Analysing screenshot…' });
-          const description = await this._describeImage(message.image);
+          const isDesignRef = /\b(build|create|make|design|replicate|match|clone|copy)\b/i.test(userPrompt);
+          const purpose = isDesignRef ? 'design' : 'debug';
+          this._send('agentEvent', { type: 'thinking', step: 0, msg: isDesignRef ? 'Analysing design reference…' : 'Analysing screenshot…' });
+          const groqKey = readKeychain('groq_api_key');
+          const description = await describeImage(message.image, purpose, groqKey, serverUrl, token);
           if (description) {
-            userPrompt = `[Screenshot attached — vision analysis:\n${description}]\n\n${message.prompt}`;
+            if (isDesignRef) {
+              userPrompt =
+                `[DESIGN REFERENCE — MATCH THIS EXACTLY]\n` +
+                `The user has provided a screenshot of the design they want. ` +
+                `Your #1 priority is to replicate this design as faithfully as possible.\n` +
+                `Do not invent a different color scheme, layout, or style — use what is described below.\n\n` +
+                `Design analysis:\n${description}\n\n` +
+                `[END DESIGN REFERENCE]\n\n${userPrompt}`;
+            } else {
+              userPrompt = `[Screenshot attached — vision analysis:\n${description}]\n\n${userPrompt}`;
+            }
           }
         }
-        const enriched = this._enrichPrompt(userPrompt, cwd, history);
+
+        const enriched = enrichPrompt(userPrompt, cwd, history, this._getMemory());
         const userTurn: Turn = { role: 'user', content: message.prompt };
-        const result = await runAgent(
-          enriched,
-          cwd,
-          (evt: AgentEvent) => this._send('agentEvent', evt),
-          this._abortController.signal,
-          serverUrl || undefined,
-          token || undefined,
-        );
-        const summary = result.summary || (result.success ? 'Done.' : 'Task finished with no summary.');
-        const assistantTurn: Turn = {
-          role: 'assistant',
-          content: result.files.length
-            ? `${summary}\nFiles touched: ${result.files.join(', ')}`
-            : summary,
+
+        // Generate plan and wait for user approval before executing
+        this._send('agentEvent', { type: 'thinking', step: 0, msg: 'Planning…' });
+        const plan = await getPlan(userPrompt, cwd, serverUrl || undefined, token || undefined);
+        const resolvedPlan = plan ?? {
+          summary: `Complete: ${userPrompt.slice(0, 80)}`,
+          steps: [
+            'Read and understand the relevant files in the project',
+            'Implement the requested changes',
+            'Verify the result works correctly',
+          ],
+          components: [] as PlanComponent[],
+          stepDetails: [] as PlanStepDetail[],
+          isDefault: true,
         };
-        const newTurns = [...history, userTurn, assistantTurn];
-        await this._updateChatTurns(activeChat.id, newTurns);
-        if (history.length === 0) {
-          await this._autoNameChat(activeChat.id, message.prompt);
-          this._send('chatNamed', { id: activeChat.id, name: this._nameChatFromMessage(message.prompt) });
-        }
-        this._send('chatDone', { success: result.success, summary, files: result.files });
-
-        if (result.files.length > 0) {
-          vscode.commands.executeCommand('workbench.view.explorer');
-          vscode.window.setStatusBarMessage(`OgaCode: ${result.files.length} file(s) written`, 4000);
-
-          const folder = this._getCwd();
-          const hasPackageJson = result.files.some(f => f.endsWith('package.json'));
-
-          // Show Expo button when agent builds a React Native / Expo project
-          const hasAppJson = result.files.some(f => f.endsWith('app.json') || f.endsWith('app.config.js'))
-            || (folder ? (await vscode.workspace.findFiles('app.json', '**/node_modules/**', 1)).length > 0 : false);
-          if (hasAppJson) { this._send('showExpobtn', {}); }
-
-          if (!hasPackageJson && folder) {
-            const path = require('path') as typeof import('path');
-            const fs = require('fs') as typeof import('fs');
-
-            // Find an HTML file: prefer files_written, fall back to workspace search
-            let htmlFile = result.files.find(f => f.endsWith('index.html') || f.endsWith('.html'));
-
-            // Resolve relative paths and verify the file actually exists
-            if (htmlFile) {
-              const abs = path.isAbsolute(htmlFile) ? htmlFile : path.join(folder, htmlFile);
-              if (!fs.existsSync(abs)) { htmlFile = undefined; }
-            }
-
-            // Fallback: search workspace for any index.html
-            if (!htmlFile) {
-              const uris = await vscode.workspace.findFiles('**/index.html', '**/node_modules/**', 5);
-              if (uris.length) {
-                htmlFile = path.relative(folder, uris[0].fsPath);
-              }
-            }
-
-            if (htmlFile) {
-              this._lastPreviewFile = htmlFile;
-              PreviewPanel.show(folder, htmlFile);
-              this._send('staticReady', { file: htmlFile });
-            } else if (this._lastPreviewFile) {
-              PreviewPanel.show(folder, this._lastPreviewFile);
-            }
-          }
-        }
+        this._pendingPlan = { enriched, userTurn, chatId: activeChat.id, history, cwd, serverUrl, token };
+        this._isAgentRunning = false;
+        this._send('showPlan', {
+          summary: resolvedPlan.summary,
+          steps: resolvedPlan.steps,
+          components: resolvedPlan.components ?? [],
+          stepDetails: resolvedPlan.stepDetails ?? [],
+          isDefault: resolvedPlan.isDefault ?? false,
+        });
+        return;
       } catch (err) {
+        this._isAgentRunning = false;
+        this._send('chatError', { msg: err instanceof Error ? err.message : 'Unknown error' });
+      }
+      return;
+    }
+
+    // ── Plan approval ─────────────────────────────────────────────────────────
+    if (message.command === 'planApprove' && this._pendingPlan) {
+      const p = this._pendingPlan;
+      this._pendingPlan = undefined;
+      this._abortController = new AbortController();
+      this._isAgentRunning = true;
+      try {
+        let enriched = p.enriched;
+        if (message.steps && message.steps.length > 0) {
+          const stepLines = message.steps.map((s, i) => {
+            const detail = message.stepDetails?.[i];
+            const verif = detail?.verification ? `\n   Verify: ${detail.verification}` : '';
+            return `${i + 1}. ${s}${verif}`;
+          }).join('\n');
+          enriched = '[APPROVED PLAN — follow these steps in order]\n' + stepLines + '\n[END PLAN]\n\n' + enriched;
+        }
+        await this._executeTask(enriched, p.userTurn, p.chatId, p.history, p.userTurn.content, p.cwd, p.serverUrl, p.token);
+      } catch (err) {
+        this._isAgentRunning = false;
+        this._send('chatError', { msg: err instanceof Error ? err.message : 'Unknown error' });
+      }
+      return;
+    }
+
+    if (message.command === 'planReject') {
+      this._pendingPlan = undefined;
+      this._isAgentRunning = false;
+      this._send('chatDone', { success: false, summary: 'Task cancelled.', files: [] });
+      return;
+    }
+
+    // ── Plan clarification — regenerate plan with user's feedback ─────────────
+    if (message.command === 'planClarify' && this._pendingPlan) {
+      const p = this._pendingPlan;
+      const clarification = ((message as unknown as { clarification?: string }).clarification ?? '').trim();
+      const refinedPrompt = clarification
+        ? `${p.userTurn.content}\n\n[User clarification]: ${clarification}`
+        : p.userTurn.content;
+      try {
+        const newPlan = await getPlan(refinedPrompt, p.cwd, p.serverUrl || undefined, p.token || undefined);
+        const resolvedNewPlan = newPlan ?? {
+          summary: `Complete: ${refinedPrompt.slice(0, 80)}`,
+          steps: ['Read and understand relevant files', 'Implement the changes', 'Verify the result'],
+          components: [] as PlanComponent[],
+          stepDetails: [] as PlanStepDetail[],
+          isDefault: true,
+        };
+        this._pendingPlan = { ...p, enriched: enrichPrompt(refinedPrompt, p.cwd, p.history, this._getMemory()) };
+        this._send('showPlanUpdate', {
+          summary: resolvedNewPlan.summary,
+          steps: resolvedNewPlan.steps,
+          components: resolvedNewPlan.components ?? [],
+          stepDetails: resolvedNewPlan.stepDetails ?? [],
+          isDefault: resolvedNewPlan.isDefault ?? false,
+        });
+      } catch (err) {
+        this._pendingPlan = undefined;
+        this._isAgentRunning = false;
         this._send('chatError', { msg: err instanceof Error ? err.message : 'Unknown error' });
       }
       return;
@@ -390,7 +391,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
 
     if (message.command === 'switchChat' && message.prompt) {
-      const chatId = message.prompt; // reuse prompt field for chatId
+      const chatId = message.prompt;
       await this._ctx.globalState.update(ACTIVE_CHAT_KEY, chatId);
       const chat = this._getAllChats().find(c => c.id === chatId);
       if (chat) {
@@ -424,6 +425,57 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (message.command === 'deploy') {
+      const folder = this._getCwd();
+      if (!folder) { this._send('deployError', { msg: 'No workspace open.' }); return; }
+      const token = readKeychain('netlify_token');
+      if (!token) { this._send('showDeploySetup', {}); return; }
+      this._send('deployStatus', { msg: 'Zipping project…' });
+      try {
+        const url = await deployToNetlify(folder, token);
+        this._send('deployDone', { url });
+      } catch (err) {
+        this._send('deployError', { msg: err instanceof Error ? err.message : 'Deploy failed.' });
+      }
+      return;
+    }
+
+    if (message.command === 'saveNetlifyToken' && message.prompt) {
+      const rawToken = message.prompt.trim();
+      const safeToken = rawToken.replace(/'/g, "'\\''");
+      try {
+        const { execSync } = require('child_process') as typeof import('child_process');
+        execSync(
+          `python -c "import keyring; keyring.set_password('ogacode','netlify_token','${safeToken}')"`,
+          { timeout: 5000, stdio: 'pipe' }
+        );
+      } catch { /* keychain write failed — still try the deploy with the raw token */ }
+      const folder = this._getCwd();
+      if (!folder) { this._send('deployError', { msg: 'No workspace open.' }); return; }
+      this._send('deployStatus', { msg: 'Zipping project…' });
+      try {
+        const url = await deployToNetlify(folder, rawToken);
+        this._send('deployDone', { url });
+      } catch (err) {
+        this._send('deployError', { msg: err instanceof Error ? err.message : 'Deploy failed.' });
+      }
+      return;
+    }
+
+    if (message.command === 'clearElement') {
+      this._selectedElement = undefined;
+      return;
+    }
+
+    if (message.command === 'saveToken') {
+      const t = ((message as unknown as { token: string }).token || '').trim();
+      if (!t) { this._send('onboardErr', { msg: 'Please enter your access code.' }); return; }
+      const cfg = vscode.workspace.getConfiguration('ogacode');
+      await cfg.update('token', t, vscode.ConfigurationTarget.Global);
+      this._send('onboardingDone', {});
+      return;
+    }
+
     if (message.command === 'stopAgent') {
       this._abortController?.abort();
       this._abortController = undefined;
@@ -438,7 +490,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     if (message.command === 'preview') {
       const folder = this._getCwd();
       if (!folder) { return; }
-      // Find any HTML file in the workspace to preview
       const uris = await vscode.workspace.findFiles('**/*.html', '**/node_modules/**', 10);
       if (!uris.length) {
         this._send('chatError', { msg: 'No HTML files found in this project.' });
@@ -482,63 +533,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       }
       return;
     }
-  }
-
-  private _enrichPrompt(prompt: string, cwd: string, history: Turn[] = []): string {
-    const NIGERIAN_CONTEXT =
-      '[NIGERIAN DEVELOPER CONTEXT]\n' +
-      'You are assisting a Nigerian developer. Always recommend free or low-cost tools first:\n' +
-      '- Database/Backend: Supabase (supabase.com) is FREE for small projects — 500MB database,\n' +
-      '  50,000 monthly active users, authentication, file storage, and edge functions included.\n' +
-      '  No credit card required. When a user asks about forms, user accounts, data storage, or a\n' +
-      '  backend API, recommend Supabase first and tell them it is free.\n' +
-      '- Static hosting: Netlify or Vercel (both free, no credit card for basic use).\n' +
-      '- Backend hosting: Railway free tier or Render free tier.\n' +
-      '- Never recommend a paid service as the primary option without explaining the free alternative.\n' +
-      '- When mentioning Supabase, always add: "Supabase is free — you will not be charged."';
-
-    const mem = this._getMemory();
-    const parts: string[] = [NIGERIAN_CONTEXT];
-    if (mem.prd)    { parts.push(`[PROJECT PRD]\n${mem.prd}`); }
-    if (mem.rules)  { parts.push(`[PROJECT RULES]\n${mem.rules}`); }
-    if (mem.skills) { parts.push(`[PROJECT SKILLS]\n${mem.skills}`); }
-
-    // Inject recent conversation history so the agent has follow-up context
-    const recentTurns = history.slice(-8); // last 4 exchanges
-    if (recentTurns.length > 0) {
-      const historyText = recentTurns
-        .map(t => `${t.role === 'user' ? 'User' : 'Assistant'}: ${t.content}`)
-        .join('\n');
-      parts.push(`[CONVERSATION HISTORY]\n${historyText}`);
-    }
-
-    let enriched = parts.length
-      ? `=== PROJECT MEMORY ===\n${parts.join('\n\n')}\n=== END ===\n\n${prompt}`
-      : prompt;
-
-    const editor = vscode.window.activeTextEditor;
-    if (!editor || editor.document.uri.scheme !== 'file') { return enriched; }
-
-    const doc = editor.document;
-    const path = require('path') as typeof import('path');
-    const relPath = path.relative(cwd, doc.uri.fsPath);
-    const content = doc.getText().slice(0, 6000);
-
-    const diagnostics = vscode.languages.getDiagnostics(doc.uri)
-      .filter(d => d.severity === vscode.DiagnosticSeverity.Error)
-      .slice(0, 15)
-      .map(d => `  Line ${d.range.start.line + 1}: ${d.message}`)
-      .join('\n');
-
-    const selected = editor.selection.isEmpty
-      ? ''
-      : doc.getText(editor.selection);
-
-    let context = `\n\n---\nActive file: ${relPath}\n\`\`\`\n${content}\n\`\`\``;
-    if (diagnostics) { context += `\n\nErrors in this file:\n${diagnostics}`; }
-    if (selected)    { context += `\n\nSelected code:\n\`\`\`\n${selected}\n\`\`\``; }
-
-    return enriched + context;
   }
 
   private _getAllChats(): Chat[] {
@@ -597,732 +591,91 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ command, ...data });
   }
 
-  private _getHtml(_webview: vscode.Webview): string {
-    const nonce = getNonce();
-    return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src https://api.qrserver.com data:;">
-  <title>OgaCode</title>
-  <style nonce="${nonce}">
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; }
-    body {
-      display: flex; flex-direction: column;
-      font-family: var(--vscode-font-family);
-      font-size: var(--vscode-font-size);
-      color: var(--vscode-foreground);
-      background: var(--vscode-sideBar-background);
+  private async _executeTask(
+    enriched: string,
+    userTurn: Turn,
+    chatId: string,
+    history: Turn[],
+    originalPrompt: string,
+    cwd: string,
+    serverUrl: string,
+    token: string,
+  ): Promise<void> {
+    const filesWritten: string[] = [];
+    const result = await runAgent(
+      enriched,
+      cwd,
+      (evt: AgentEvent) => {
+        if (evt.type === 'pre_tool_use') {
+          const args = (evt as { args?: Record<string, unknown> }).args;
+          const fp = (args?.file_path ?? args?.path) as string | undefined;
+          if (fp && !filesWritten.includes(fp)) { filesWritten.push(fp); }
+        }
+        this._send('agentEvent', evt);
+      },
+      this._abortController!.signal,
+      serverUrl || undefined,
+      token || undefined,
+    );
+
+    const summary = result.summary || (result.success ? 'Done.' : 'Task finished with no summary.');
+    const assistantTurn: Turn = {
+      role: 'assistant',
+      content: result.files.length
+        ? `${summary}\nFiles touched: ${result.files.join(', ')}`
+        : summary,
+    };
+    await this._updateChatTurns(chatId, [...history, userTurn, assistantTurn]);
+    if (history.length === 0) {
+      await this._autoNameChat(chatId, originalPrompt);
+      this._send('chatNamed', { id: chatId, name: this._nameChatFromMessage(originalPrompt) });
+    }
+    this._isAgentRunning = false;
+    this._send('chatDone', { success: result.success, summary, files: result.files });
+
+    if (result.success && cwd) {
+      await autoReview(
+        enriched, summary, filesWritten, cwd,
+        serverUrl || undefined, token || undefined,
+        this._send.bind(this),
+      );
     }
 
-    /* ── Topbar ── */
-    #topbar {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 4px 8px;
-      border-bottom: 1px solid var(--vscode-panel-border, #333);
-      font-size: 10px; opacity: 0.7; flex-shrink: 0;
-    }
-    #projectLabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    if (result.files.length > 0) {
+      vscode.commands.executeCommand('workbench.view.explorer');
+      vscode.window.setStatusBarMessage(`OgaCode: ${result.files.length} file(s) written`, 4000);
 
-    /* ── Thread ── */
-    #thread {
-      flex: 1; overflow-y: auto; padding: 10px 8px;
-      display: flex; flex-direction: column; gap: 10px;
-    }
-
-    /* ── Bubbles ── */
-    .msg { display: flex; flex-direction: column; max-width: 88%; }
-    .msg.user  { align-self: flex-end; align-items: flex-end; }
-    .msg.bot   { align-self: flex-start; align-items: flex-start; }
-
-    .bubble {
-      padding: 8px 12px; border-radius: 14px;
-      line-height: 1.45; white-space: pre-wrap; word-break: break-word;
-    }
-    .user  .bubble {
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
-      border-bottom-right-radius: 3px;
-    }
-    .bot .bubble {
-      background: var(--vscode-editor-inactiveSelectionBackground, #2a2d2e);
-      border-bottom-left-radius: 3px;
-    }
-    .bot .bubble.err { color: #f88; }
-    .bot .bubble b { font-weight: 600; }
-    .bot .bubble code { font-family: monospace; background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 2px; font-size: 0.9em; }
-    .bot .bubble pre { background: rgba(255,255,255,0.06); padding: 6px 8px; border-radius: 4px; overflow-x: auto; font-size: 11px; margin: 4px 0; }
-
-    /* ── Tool activity ── */
-    .activity {
-      font-size: 10px; opacity: 0.55; margin-top: 4px;
-      max-height: 70px; overflow-y: auto;
-      padding-left: 4px;
-    }
-    .activity div { margin: 1px 0; white-space: pre-wrap; word-break: break-all; }
-
-    /* ── File chips ── */
-    .files { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
-    .chip {
-      padding: 2px 8px;
-      background: var(--vscode-badge-background);
-      color: var(--vscode-badge-foreground);
-      font-size: 10px; font-family: monospace; border-radius: 3px;
-    }
-
-    /* ── Typing dots ── */
-    .dots span {
-      display: inline-block; width: 5px; height: 5px; border-radius: 50%;
-      background: currentColor; margin: 0 2px; opacity: 0.4;
-      animation: bounce 1.2s infinite;
-    }
-    .dots span:nth-child(2) { animation-delay: 0.2s; }
-    .dots span:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes bounce { 0%,80%,100%{transform:translateY(0);opacity:.4} 40%{transform:translateY(-4px);opacity:1} }
-
-    /* ── Dev server / Expo buttons ── */
-    #runbtn  { display: none; width: 100%; margin-top: 4px; }
-    #expobtn { display: none; width: 100%; margin-top: 4px; }
-
-    /* ── History dropdown ── */
-    #topbar { position: relative; }
-    #historyBtn {
-      flex: 1; text-align: left; background: none; border: none; color: inherit;
-      font-size: 11px; font-weight: 600; cursor: pointer;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 170px;
-      padding: 0;
-    }
-    #historyDropdown {
-      position: absolute; top: 28px; left: 0; right: 0; z-index: 100;
-      background: var(--vscode-menu-background, #252526);
-      border: 1px solid var(--vscode-panel-border, #333);
-      max-height: 260px; overflow-y: auto; display: none;
-    }
-    .hd-item {
-      display: flex; align-items: center; gap: 4px; padding: 5px 8px;
-      cursor: pointer; font-size: 11px;
-    }
-    .hd-item:hover, .hd-item.active { background: var(--vscode-list-hoverBackground, #2a2d2e); }
-    .hd-proj { font-size: 9px; opacity: 0.5; margin: 6px 8px 2px; text-transform: uppercase; letter-spacing: 0.5px; }
-    .hd-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .hd-actions { display: flex; gap: 2px; opacity: 0; flex-shrink: 0; }
-    .hd-item:hover .hd-actions { opacity: 1; }
-    .hd-new { border-top: 1px solid var(--vscode-panel-border, #333); color: var(--vscode-textLink-foreground, #4fc); }
-
-    /* ── Input area ── */
-    #inputArea {
-      padding: 8px;
-      border-top: 1px solid var(--vscode-panel-border, #333);
-    }
-    #inputRow { display: flex; gap: 4px; align-items: flex-end; }
-    textarea {
-      flex: 1; min-height: 36px;
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border: 1px solid var(--vscode-input-border, #555);
-      padding: 6px 8px; font: inherit; resize: none; overflow-y: auto;
-    }
-    .icon-btn {
-      flex-shrink: 0; width: 32px; height: 32px;
-      background: var(--vscode-button-secondaryBackground, #3a3d41);
-      color: var(--vscode-button-secondaryForeground, #ccc);
-      border: none; cursor: pointer; border-radius: 4px;
-      font-size: 14px; display: flex; align-items: center; justify-content: center;
-    }
-    #sendbtn {
-      flex-shrink: 0; width: 32px; height: 32px;
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
-      border: none; cursor: pointer; border-radius: 4px;
-      font-size: 16px; display: flex; align-items: center; justify-content: center;
-    }
-    #sendbtn:disabled, .icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    #stopbtn {
-      display: none; flex-shrink: 0; width: 32px; height: 32px;
-      background: #8b0000; color: #fff;
-      border: none; cursor: pointer; border-radius: 4px;
-      font-size: 14px; align-items: center; justify-content: center;
-    }
-    #stopbtn.visible { display: flex; }
-    #hint { font-size: 10px; opacity: 0.45; margin-top: 4px; text-align: center; }
-
-    /* ── Image preview ── */
-    #imagePreview {
-      display: none; position: relative; margin-top: 4px; width: fit-content;
-    }
-    #imagePreview img {
-      max-height: 72px; max-width: 100%; border-radius: 4px;
-      border: 1px solid var(--vscode-input-border, #555); display: block;
-    }
-    #removeImg {
-      position: absolute; top: -5px; right: -5px;
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
-      border: none; border-radius: 50%; width: 16px; height: 16px;
-      font-size: 11px; cursor: pointer; line-height: 16px; text-align: center; padding: 0;
-    }
-    .user .bubble img { max-height: 120px; border-radius: 4px; display: block; margin-bottom: 4px; }
-
-    /* ── Memory panel ── */
-    #memoryPanel {
-      display: none; flex: 1; overflow-y: auto;
-      padding: 8px; flex-direction: column; gap: 8px;
-    }
-    #memoryPanel.open { display: flex; }
-    .mem-section { display: flex; flex-direction: column; gap: 4px; }
-    .mem-header { display: flex; align-items: center; justify-content: space-between; }
-    .mem-label { font-size: 11px; font-weight: 600; opacity: 0.8; }
-    .mem-textarea {
-      width: 100%; min-height: 70px; max-height: 130px;
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border: 1px solid var(--vscode-input-border, #555);
-      padding: 4px 6px; font: inherit; resize: vertical; font-size: 11px;
-    }
-    #saveMemBtn {
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
-      border: none; padding: 6px; cursor: pointer; border-radius: 3px;
-      font-size: 12px;
-    }
-  </style>
-</head>
-<body>
-  <div id="topbar">
-    <button id="historyBtn">New Chat &#9662;</button>
-    <div id="historyDropdown"></div>
-    <div style="display:flex;gap:4px;flex-shrink:0;">
-      <button class="icon-btn" id="memorybtn" title="Project memory">&#128203;</button>
-      <button class="icon-btn" id="newchatbtn" title="New chat">&#65291;</button>
-    </div>
-  </div>
-  <div id="memoryPanel">
-    <div class="mem-section">
-      <div class="mem-header">
-        <span class="mem-label">PRD</span>
-        <button class="icon-btn" id="uploadPrd" title="Upload file">&#128206;</button>
-      </div>
-      <textarea class="mem-textarea" id="memPrd" placeholder="What you&#x27;re building &#8212; goals, users, features&#8230;"></textarea>
-    </div>
-    <div class="mem-section">
-      <div class="mem-header">
-        <span class="mem-label">Rules</span>
-        <button class="icon-btn" id="uploadRules" title="Upload file">&#128206;</button>
-      </div>
-      <textarea class="mem-textarea" id="memRules" placeholder="Coding conventions, stack choices, constraints&#8230;"></textarea>
-    </div>
-    <div class="mem-section">
-      <div class="mem-header">
-        <span class="mem-label">Skills</span>
-        <button class="icon-btn" id="uploadSkills" title="Upload file">&#128206;</button>
-      </div>
-      <textarea class="mem-textarea" id="memSkills" placeholder="Reusable patterns, techniques, component styles&#8230;"></textarea>
-    </div>
-    <button id="saveMemBtn">Save Memory</button>
-  </div>
-  <div id="thread">
-    <div class="msg bot">
-      <div class="bubble">Hey! I'm OgaCode. Tell me what you want to build or change — I'll handle the code.</div>
-    </div>
-  </div>
-
-  <div id="inputArea">
-    <div id="imagePreview">
-      <img id="previewImg" src="" alt="pasted screenshot">
-      <button id="removeImg" title="Remove image">&#215;</button>
-    </div>
-    <div id="inputRow">
-      <textarea id="inp" rows="1" placeholder="Ask me anything… (paste a screenshot)"></textarea>
-      <button class="icon-btn" id="prevbtn" title="Preview HTML">&#128065;</button>
-      <button id="stopbtn" title="Stop">&#9632;</button>
-      <button id="sendbtn" title="Send (Enter)">&#10148;</button>
-    </div>
-    <button type="button" id="runbtn">&#9654; Run Dev Server</button>
-    <button type="button" id="expobtn">&#128242; Run Expo</button>
-    <div id="hint">Enter to send &nbsp;·&nbsp; Shift+Enter for new line</div>
-  </div>
-
-  <script nonce="${nonce}">
-    var api            = acquireVsCodeApi();
-    var thread         = document.getElementById('thread');
-    var inp            = document.getElementById('inp');
-    var sendbtn        = document.getElementById('sendbtn');
-    var prevbtn        = document.getElementById('prevbtn');
-    var runbtn         = document.getElementById('runbtn');
-    var expobtn        = document.getElementById('expobtn');
-    var newchatbtn     = document.getElementById('newchatbtn');
-    var memorybtn      = document.getElementById('memorybtn');
-    var memPanel       = document.getElementById('memoryPanel');
-    var historyBtn     = document.getElementById('historyBtn');
-    var historyDropdown = document.getElementById('historyDropdown');
-    var memPrd      = document.getElementById('memPrd');
-    var memRules    = document.getElementById('memRules');
-    var memSkills   = document.getElementById('memSkills');
-    var uploadPrd   = document.getElementById('uploadPrd');
-    var uploadRules = document.getElementById('uploadRules');
-    var uploadSkills= document.getElementById('uploadSkills');
-    var saveMemBtn  = document.getElementById('saveMemBtn');
-
-    var currentBot = null;  // the bot message being built right now
-    var runnerStarted = false; // true once the first agentEvent arrives
-    var pendingImage = null;  // base64 data URL of pasted screenshot
-    var activeChatId = null;
-    var stopbtn = document.getElementById('stopbtn');
-
-    stopbtn.addEventListener('click', function() {
-      api.postMessage({ command: 'stopAgent' });
-      stopbtn.classList.remove('visible');
-      sendbtn.disabled = false;
-      finishBotMsg('Interrupted.', true);
-    });
-
-    /* ── History dropdown helpers ── */
-    function renderChatList(chats, activeId) {
-      activeChatId = activeId;
-      historyDropdown.innerHTML = '';
-      var groups = {};
-      chats.forEach(function(c) { (groups[c.project] = groups[c.project] || []).push(c); });
-      Object.keys(groups).forEach(function(proj) {
-        var lbl = document.createElement('div');
-        lbl.className = 'hd-proj'; lbl.textContent = proj;
-        historyDropdown.appendChild(lbl);
-        groups[proj].forEach(function(c) { historyDropdown.appendChild(makeChatItem(c, activeId)); });
-      });
-      var newRow = document.createElement('div');
-      newRow.className = 'hd-item hd-new';
-      newRow.innerHTML = '<span class="hd-name">&#65291; New Chat</span>';
-      newRow.addEventListener('click', function() {
-        historyDropdown.style.display = 'none';
-        api.postMessage({ command: 'newChat' });
-      });
-      historyDropdown.appendChild(newRow);
-    }
-
-    function makeChatItem(c, activeId) {
-      var el = document.createElement('div');
-      el.className = 'hd-item' + (c.id === activeId ? ' active' : '');
-      el.innerHTML =
-        '<span class="hd-name">' + esc(c.name) + '</span>' +
-        '<span class="hd-actions">' +
-        '<button class="icon-btn" style="width:18px;height:18px;font-size:10px" title="Rename">&#9998;</button>' +
-        '<button class="icon-btn" style="width:18px;height:18px;font-size:10px" title="Delete">&#128465;</button>' +
-        '</span>';
-      el.querySelector('.hd-name').addEventListener('click', function() {
-        historyDropdown.style.display = 'none';
-        api.postMessage({ command: 'switchChat', prompt: c.id });
-      });
-      var btns = el.querySelectorAll('.icon-btn');
-      btns[0].addEventListener('click', function(e) {
-        e.stopPropagation();
-        var newName = prompt('Rename chat:', c.name);
-        if (newName && newName.trim()) { api.postMessage({ command: 'renameChat', prompt: c.id, slot: newName.trim() }); }
-      });
-      btns[1].addEventListener('click', function(e) {
-        e.stopPropagation();
-        if (confirm('Delete "' + c.name + '"?')) { api.postMessage({ command: 'deleteChat', prompt: c.id }); }
-      });
-      return el;
-    }
-
-    function repopulateThread(turns, chatName) {
-      thread.innerHTML = '';
-      if (!turns || !turns.length) {
-        thread.innerHTML = '<div class="msg bot"><div class="bubble">Hey! I&#39;m OgaCode. Tell me what to build or fix.</div></div>';
-      } else {
-        turns.forEach(function(t) {
-          if (t.role === 'user') { addUserMsg(t.content, null); }
-          else {
-            var el = document.createElement('div');
-            el.className = 'msg bot';
-            el.innerHTML = '<div class="bubble">' + mdToHtml(t.content) + '</div><div class="activity"></div><div class="files"></div>';
-            thread.appendChild(el);
-          }
-        });
+      const touchedWeb = result.files.some(f => /\.(html|css|js|ts|jsx|tsx)$/.test(f));
+      if (touchedWeb && this._lastPreviewFile) {
+        setTimeout(() => PreviewPanel.show(this._getCwd(), this._lastPreviewFile!), 800);
       }
-      if (chatName) { historyBtn.textContent = chatName + ' ▾'; }
-      scrollBottom();
-    }
 
-    historyBtn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      var open = historyDropdown.style.display === 'none' || historyDropdown.style.display === '';
-      historyDropdown.style.display = open ? 'block' : 'none';
-      if (open) { api.postMessage({ command: 'listChats' }); }
-    });
+      const folder = this._getCwd();
+      const hasPackageJson = result.files.some(f => f.endsWith('package.json'));
+      const hasAppJson = result.files.some(f => f.endsWith('app.json') || f.endsWith('app.config.js'))
+        || (folder ? (await vscode.workspace.findFiles('app.json', '**/node_modules/**', 1)).length > 0 : false);
+      if (hasAppJson) { this._send('showExpobtn', {}); }
 
-    document.addEventListener('click', function(e) {
-      if (!historyBtn.contains(e.target) && !historyDropdown.contains(e.target)) {
-        historyDropdown.style.display = 'none';
-      }
-    });
-
-    /* ── Image paste ── */
-    var imagePreview = document.getElementById('imagePreview');
-    var previewImg   = document.getElementById('previewImg');
-    var removeImg    = document.getElementById('removeImg');
-
-    inp.addEventListener('paste', function(e) {
-      var items = e.clipboardData && e.clipboardData.items;
-      if (!items) { return; }
-      for (var i = 0; i < items.length; i++) {
-        if (items[i].type.startsWith('image/')) {
-          e.preventDefault();
-          var file = items[i].getAsFile();
-          var reader = new FileReader();
-          reader.onload = function(ev) {
-            pendingImage = ev.target.result;
-            previewImg.src = pendingImage;
-            imagePreview.style.display = 'block';
-          };
-          reader.readAsDataURL(file);
-          break;
+      if (!hasPackageJson && folder) {
+        const path = require('path') as typeof import('path');
+        const fs = require('fs') as typeof import('fs');
+        let htmlFile = result.files.find(f => f.endsWith('index.html') || f.endsWith('.html'));
+        if (htmlFile) {
+          const abs = path.isAbsolute(htmlFile) ? htmlFile : path.join(folder, htmlFile);
+          if (!fs.existsSync(abs)) { htmlFile = undefined; }
+        }
+        if (!htmlFile) {
+          const uris = await vscode.workspace.findFiles('**/index.html', '**/node_modules/**', 5);
+          if (uris.length) { htmlFile = path.relative(folder, uris[0].fsPath); }
+        }
+        if (htmlFile) {
+          this._lastPreviewFile = htmlFile;
+          PreviewPanel.show(folder, htmlFile);
+          this._send('staticReady', { file: htmlFile });
+        } else if (this._lastPreviewFile) {
+          PreviewPanel.show(folder, this._lastPreviewFile);
         }
       }
-    });
-
-    removeImg.addEventListener('click', function() {
-      pendingImage = null;
-      previewImg.src = '';
-      imagePreview.style.display = 'none';
-    });
-
-    /* ── Helpers ── */
-    function esc(s) {
-      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
-
-    function mdToHtml(text) {
-      var s = esc(text);
-      s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
-      s = s.replace(/^#{1,3} (.+)$/gm, '<b>$1</b>');
-      s = s.replace(/\\n/g, '<br>');
-      return s;
-    }
-
-    function scrollBottom() { thread.scrollTop = thread.scrollHeight; }
-
-    function addUserMsg(text, imgSrc) {
-      var el = document.createElement('div');
-      el.className = 'msg user';
-      var imgHtml = imgSrc ? '<img src="' + imgSrc + '" alt="screenshot">' : '';
-      el.innerHTML = '<div class="bubble">' + imgHtml + esc(text) + '</div>';
-      thread.appendChild(el);
-      scrollBottom();
-    }
-
-    function startBotMsg() {
-      var el = document.createElement('div');
-      el.className = 'msg bot';
-      el.innerHTML =
-        '<div class="bubble"><span class="dots"><span></span><span></span><span></span></span></div>' +
-        '<div class="activity"></div>' +
-        '<div class="files"></div>';
-      thread.appendChild(el);
-      scrollBottom();
-      currentBot = el;
-      return el;
-    }
-
-    function addActivity(text) {
-      if (!currentBot) { return; }
-      var act = currentBot.querySelector('.activity');
-      var d = document.createElement('div');
-      d.textContent = text;
-      act.appendChild(d);
-      act.scrollTop = act.scrollHeight;
-    }
-
-    function finishBotMsg(text, isErr) {
-      if (!currentBot) { return; }
-      var bubble = currentBot.querySelector('.bubble');
-      bubble.innerHTML = isErr ? esc(text) : mdToHtml(text);
-      if (isErr) { bubble.classList.add('err'); }
-      currentBot = null;
-      scrollBottom();
-    }
-
-    function addFileChips(files) {
-      if (!files || !files.length) { return; }
-      var lastBot = thread.querySelector('.msg.bot:last-child');
-      if (!lastBot) { return; }
-      var fbox = lastBot.querySelector('.files');
-      files.forEach(function(f) {
-        var chip = document.createElement('span');
-        chip.className = 'chip';
-        chip.textContent = f.split(/[\\\\/]/).pop();
-        fbox.appendChild(chip);
-      });
-    }
-
-    function formatEvent(ev) {
-      if (ev.type === 'thinking')     { return 'Thinking… (step ' + ev.step + ')'; }
-      if (ev.type === 'provider')     { return 'Using ' + ev.name; }
-      if (ev.type === 'pre_tool_use') {
-        var args = ev.args || {};
-        var parts = Object.keys(args).map(function(k) {
-          var v = String(args[k]);
-          return k + ': ' + (v.length > 50 ? v.slice(0, 50) + '…' : v);
-        });
-        return ev.tool + '(' + parts.join(', ') + ')';
-      }
-      if (ev.type === 'post_tool_use' && !ev.success) { return 'Error: ' + ev.error; }
-      if (ev.type === 'correction') { return 'Retrying: ' + ev.msg; }
-      if (ev.type === 'supervisor') { return 'Reviewing: ' + ev.msg; }
-      if (ev.type === 'escalate')   { return 'Need input: ' + ev.msg; }
-      return '';
-    }
-
-    /* ── Send ── */
-    var sendTimer = null;
-    function unlockSend() {
-      sendbtn.disabled = false;
-      stopbtn.classList.remove('visible');
-      if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
-    }
-
-    function send() {
-      if (sendbtn.disabled) { return; }
-      var text = inp.value.trim();
-      if (!text) { return; }
-      inp.value = '';
-      inp.style.height = 'auto';
-      sendbtn.disabled = true;
-      stopbtn.classList.add('visible');
-      runnerStarted = false;
-      var imageToSend = pendingImage;
-      pendingImage = null;
-      previewImg.src = '';
-      imagePreview.style.display = 'none';
-      addUserMsg(text, imageToSend);
-      startBotMsg();
-      api.postMessage({ command: 'chat', prompt: text, image: imageToSend || undefined });
-      // 45 s startup watchdog — resets to 180 s once the runner emits its first event
-      sendTimer = setTimeout(function() {
-        unlockSend();
-        finishBotMsg('OgaCode engine did not start. Check ONBOARDING.md for setup steps.', true);
-      }, 45000);
-    }
-
-    sendbtn.addEventListener('click', send);
-
-    /* ── Keyboard: Enter = send, Shift+Enter = new line ── */
-    var shiftDown = false;
-    document.addEventListener('keydown', function(e) { if (e.key === 'Shift') { shiftDown = true; } });
-    document.addEventListener('keyup',   function(e) { if (e.key === 'Shift') { shiftDown = false; } });
-
-    inp.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-    });
-
-    inp.addEventListener('input', function() {
-      inp.style.height = 'auto';
-      inp.style.height = inp.scrollHeight + 'px';
-    });
-
-    prevbtn.addEventListener('click', function() {
-      api.postMessage({ command: 'preview' });
-    });
-
-    newchatbtn.addEventListener('click', function() {
-      api.postMessage({ command: 'newChat' });
-    });
-
-    memorybtn.addEventListener('click', function() {
-      var open = memPanel.classList.toggle('open');
-      thread.style.display = open ? 'none' : '';
-      if (open) { api.postMessage({ command: 'loadMemory' }); }
-    });
-
-    uploadPrd.addEventListener('click', function() {
-      api.postMessage({ command: 'pickMemoryFile', slot: 'prd' });
-    });
-    uploadRules.addEventListener('click', function() {
-      api.postMessage({ command: 'pickMemoryFile', slot: 'rules' });
-    });
-    uploadSkills.addEventListener('click', function() {
-      api.postMessage({ command: 'pickMemoryFile', slot: 'skills' });
-    });
-
-    saveMemBtn.addEventListener('click', function() {
-      api.postMessage({ command: 'saveMemory', prd: memPrd.value, rules: memRules.value, skills: memSkills.value });
-    });
-
-    runbtn.addEventListener('click', function() {
-      runbtn.disabled = true;
-      runbtn.textContent = '⏳ Starting server…';
-      api.postMessage({ command: 'runDevServer' });
-    });
-
-    expobtn.addEventListener('click', function() {
-      expobtn.disabled = true;
-      expobtn.textContent = '⏳ Starting Expo…';
-      api.postMessage({ command: 'runExpo' });
-    });
-
-    /* ── Messages from extension ── */
-    window.addEventListener('message', function(e) {
-      var d = e.data;
-
-      if (d.command === 'setProject') {
-        // project name now shown per-chat in dropdown
-        return;
-      }
-
-      if (d.command === 'chatCleared') {
-        repopulateThread([], d.chatName || 'New Chat');
-        unlockSend();
-        return;
-      }
-
-      if (d.command === 'chatList') {
-        renderChatList(d.chats || [], d.activeChatId || '');
-        return;
-      }
-
-      if (d.command === 'chatLoaded') {
-        repopulateThread(d.turns || [], d.chatName);
-        unlockSend();
-        return;
-      }
-
-      if (d.command === 'chatNamed') {
-        historyBtn.textContent = (d.name || 'Chat') + ' ▾';
-        return;
-      }
-
-      if (d.command === 'chatRenamed') {
-        if (d.chatId === activeChatId) { historyBtn.textContent = (d.name || 'Chat') + ' ▾'; }
-        if (historyDropdown.style.display !== 'none') { api.postMessage({ command: 'listChats' }); }
-        return;
-      }
-
-      if (d.command === 'chatDeleted') {
-        repopulateThread(d.turns || [], d.chatName);
-        unlockSend();
-        return;
-      }
-
-      if (d.command === 'agentEvent') {
-        var line = formatEvent(d);
-        if (line) { addActivity(line); }
-        // First event: runner is alive — switch from startup watchdog to full 180 s timeout
-        if (sendTimer) {
-          clearTimeout(sendTimer);
-          runnerStarted = true;
-          sendTimer = setTimeout(function() {
-            unlockSend();
-            finishBotMsg('No response received. Check your connection and try again.', true);
-          }, 180000);
-        }
-        return;
-      }
-
-      if (d.command === 'chatDone') {
-        unlockSend();
-        finishBotMsg(d.summary, !d.success);
-        if (d.files && d.files.length) {
-          addFileChips(d.files);
-          var hasPackageJson = d.files.some(function(f) { return f.indexOf('package.json') !== -1; });
-          if (hasPackageJson) { runbtn.style.display = 'block'; runbtn.disabled = false; runbtn.textContent = '▶ Run Dev Server'; }
-          var hasAppJson = d.files.some(function(f) { return f.indexOf('app.json') !== -1 || f.indexOf('app.config.js') !== -1; });
-          if (hasAppJson) { expobtn.style.display = 'block'; expobtn.disabled = false; expobtn.textContent = '📱 Run Expo'; }
-        }
-        return;
-      }
-
-      if (d.command === 'chatError') {
-        unlockSend();
-        finishBotMsg('Sorry, something went wrong: ' + d.msg, true);
-        return;
-      }
-
-      if (d.command === 'staticReady') {
-        var lastBot = thread.querySelector('.msg.bot:last-child');
-        if (lastBot) {
-          var note = document.createElement('div');
-          note.style.cssText = 'font-size:10px;opacity:.6;margin-top:4px;';
-          note.textContent = '↗ Opened preview for ' + d.file.split(/[\\\\/]/).pop();
-          lastBot.querySelector('.files').appendChild(note);
-        }
-        return;
-      }
-
-      if (d.command === 'devServerReady') {
-        runbtn.disabled = false;
-        runbtn.textContent = '▶ Run Dev Server';
-        var lastBot = thread.querySelector('.msg.bot:last-child');
-        if (lastBot) {
-          var note2 = document.createElement('div');
-          note2.style.cssText = 'font-size:10px;color:#6f6;margin-top:4px;';
-          note2.textContent = '↗ Server live at localhost:3000';
-          lastBot.querySelector('.files').appendChild(note2);
-        }
-        return;
-      }
-
-      if (d.command === 'devServerError') {
-        runbtn.disabled = false;
-        runbtn.textContent = '▶ Run Dev Server';
-        addActivity('Server error: ' + d.error);
-        return;
-      }
-
-      if (d.command === 'showExpobtn') {
-        expobtn.style.display = 'block';
-        expobtn.disabled = false;
-        expobtn.textContent = '📱 Run Expo';
-        return;
-      }
-
-      if (d.command === 'expoReady') {
-        expobtn.disabled = false;
-        expobtn.textContent = '📱 Run Expo';
-        var qrWrap = document.createElement('div');
-        qrWrap.style.cssText = 'margin-top:8px;text-align:center;';
-        var qrImg = document.createElement('img');
-        qrImg.src = 'https://api.qrserver.com/v1/create-qr-code/?data=' + encodeURIComponent(d.url) + '&size=160x160&margin=4';
-        qrImg.alt = 'Expo QR Code';
-        qrImg.style.cssText = 'border-radius:6px;background:#fff;padding:4px;display:block;margin:0 auto;';
-        var qrNote = document.createElement('div');
-        qrNote.style.cssText = 'font-size:10px;opacity:.7;margin-top:4px;';
-        qrNote.textContent = 'Scan with Expo Go · ' + d.url;
-        qrWrap.appendChild(qrImg);
-        qrWrap.appendChild(qrNote);
-        var lastBubble = thread.querySelector('.msg.bot:last-child .bubble');
-        if (lastBubble) { lastBubble.appendChild(qrWrap); }
-        return;
-      }
-
-      if (d.command === 'expoError') {
-        expobtn.disabled = false;
-        expobtn.textContent = '📱 Run Expo';
-        addActivity('Expo error: ' + d.error);
-        return;
-      }
-
-      if (d.command === 'memoryLoaded') {
-        memPrd.value    = d.prd    || '';
-        memRules.value  = d.rules  || '';
-        memSkills.value = d.skills || '';
-        return;
-      }
-
-      if (d.command === 'memoryFilePicked') {
-        if (d.slot === 'prd')    { memPrd.value    = d.content; }
-        if (d.slot === 'rules')  { memRules.value  = d.content; }
-        if (d.slot === 'skills') { memSkills.value = d.content; }
-        return;
-      }
-
-      if (d.command === 'memorySaved') {
-        saveMemBtn.textContent = 'Saved!';
-        setTimeout(function() { saveMemBtn.textContent = 'Save Memory'; }, 1500);
-        return;
-      }
-    });
-  </script>
-</body>
-</html>`;
   }
 }
