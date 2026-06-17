@@ -127,8 +127,8 @@ export function getSidebarHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     .hd-item:hover, .hd-item.active { background: var(--vscode-list-hoverBackground, #2a2d2e); }
     .hd-proj { font-size: 9px; opacity: 0.5; margin: 6px 8px 2px; text-transform: uppercase; letter-spacing: 0.5px; }
     .hd-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .hd-actions { display: flex; gap: 2px; opacity: 0; flex-shrink: 0; }
-    .hd-item:hover .hd-actions { opacity: 1; }
+    .hd-actions { display: flex; gap: 2px; flex-shrink: 0; visibility: hidden; pointer-events: none; }
+    .hd-item:hover .hd-actions, .hd-item:focus-within .hd-actions { visibility: visible; pointer-events: auto; }
     .hd-new { border-top: 1px solid var(--vscode-panel-border, #333); color: var(--vscode-textLink-foreground, #4fc); }
 
     /* ── Input area ── */

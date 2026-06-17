@@ -491,6 +491,7 @@ var api            = acquireVsCodeApi();
       }
 
       if (d.command === 'showPlan') {
+        if (!currentBot) { startBotMsg(); }
         if (currentBot) {
           var bubble = currentBot.querySelector('.bubble');
           var renderPlan = function(steps, summary, components, stepDetails, isDefault) {

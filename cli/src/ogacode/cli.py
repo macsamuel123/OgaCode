@@ -180,8 +180,16 @@ def setup() -> None:
 
 @_cli.command()
 def doctor() -> None:
+    import sys
     import httpx
+    import keyring as _kr
     console.print("[bold]OgaCode Doctor[/]\n")
+
+    # Python version
+    ok_py = sys.version_info >= (3, 10)
+    console.print(f"  {'[green]OK[/]' if ok_py else '[red]FAIL[/]'} Python {sys.version.split()[0]}" + ("" if ok_py else " — Python 3.10+ required"))
+
+    # LLM provider keys
     for name, url, key_name in [
         ("DeepSeek", "https://api.deepseek.com/v1/models",    "deepseek_api_key"),
         ("Groq",     "https://api.groq.com/openai/v1/models", "groq_api_key"),
@@ -195,6 +203,29 @@ def doctor() -> None:
             console.print(f"  [green]OK[/] {name}: connected" if r.status_code == 200 else f"  [red]FAIL[/] {name}: HTTP {r.status_code}")
         except Exception:
             console.print(f"  [red]FAIL[/] {name}: unreachable")
+
+    # OgaCode managed server health
+    server_url = os.environ.get("OGACODE_SERVER_URL", "").rstrip("/")
+    if server_url:
+        try:
+            r = httpx.get(f"{server_url}/health", timeout=6)
+            if r.status_code == 200:
+                console.print(f"  [green]OK[/] Server reachable ({server_url})")
+            else:
+                console.print(f"  [red]FAIL[/] Server returned HTTP {r.status_code}")
+        except Exception:
+            console.print(f"  [red]FAIL[/] Server unreachable — check your internet connection")
+
+        # Token validity
+        token = _kr.get_password("ogacode", "token") or ""
+        if token:
+            console.print("  [green]OK[/] Token configured")
+        else:
+            console.print("  [-] Token not configured  --  run [bold]ogacode setup[/]")
+    else:
+        console.print("  [-] Server URL not set (OGACODE_SERVER_URL) — using local providers only")
+
+    # Ollama
     try:
         r = httpx.get("http://localhost:11434/api/tags", timeout=3)
         if r.status_code == 200:
@@ -221,10 +252,13 @@ def rollback() -> None:
     restored = 0
     seen: set[str] = set()
     for b in backups:
-        parts = b.name.rsplit(".", 2)
-        if len(parts) < 3:
+        # Backup format: <original_name>.<timestamp>.bak
+        # Use rfind twice to strip .bak then .<timestamp>, preserving dots in the original name
+        stem = b.name[: b.name.rfind(".")]   # strip .bak
+        stem = stem[: stem.rfind(".")]        # strip .<timestamp>
+        original_name = stem
+        if not original_name:
             continue
-        original_name = parts[0]
         if original_name in seen:
             continue
         seen.add(original_name)

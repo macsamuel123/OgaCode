@@ -4,7 +4,10 @@ Validates user token and forwards requests to DeepSeek/Groq using server-held ke
 This is the entry point for Railway — keeps imports minimal to avoid crash loops.
 """
 import asyncio
+import hashlib
+import hmac
 import os
+from collections import defaultdict
 print(f"[OgaCode] PORT env var = {os.getenv('PORT', 'NOT SET')}", flush=True)
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -176,3 +179,39 @@ async def vision_proxy(request: Request):
         return JSONResponse({"description": description})
     except Exception:
         raise HTTPException(status_code=502, detail="Vision processing failed. Please try again.")
+
+
+# ── Paystack billing webhook ──────────────────────────────────────────────────
+
+@app.post("/webhook/paystack")
+async def paystack_webhook(request: Request) -> dict:
+    payload = await request.body()
+    signature = request.headers.get("x-paystack-signature", "")
+    secret = os.getenv("PAYSTACK_SECRET_KEY", "")
+    if not secret:
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
+    expected = hmac.new(secret.encode(), payload, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    event_data: dict = await request.json()
+    event_type: str = event_data.get("event", "unknown")
+    # TODO: handle subscription.create → provision credits
+    # TODO: handle charge.success → resume suspended account
+    # TODO: handle subscription.disable → suspend account
+    return {"received": True, "event": event_type}
+
+
+# ── Opt-in telemetry (in-memory, resets on restart) ──────────────────────────
+
+_telemetry: dict = defaultdict(int)
+
+@app.post("/telemetry")
+async def record_telemetry(request: Request) -> dict:
+    body = await request.json()
+    event = str(body.get("event", "unknown"))[:64]
+    _telemetry[event] += 1
+    return {"ok": True}
+
+@app.get("/telemetry/summary")
+async def telemetry_summary() -> dict:
+    return dict(_telemetry)

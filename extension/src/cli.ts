@@ -161,6 +161,15 @@ export function readKeychain(keyName: string): string {
  * Spawns the OgaCode Python CLI as a subprocess.
  * Passes OGACODE_SERVER_URL + OGACODE_TOKEN so the CLI routes through the managed server.
  */
+function friendlyError(msg: string): string {
+  if (/timed?\s*out|warming up/i.test(msg))      { return 'OgaCode is warming up — please wait 30 seconds and try again.'; }
+  if (/node.*not found|cannot start node/i.test(msg)) { return 'Node.js not found. Install it from nodejs.org and restart VS Code.'; }
+  if (/python.*not found|cannot start python/i.test(msg)) { return 'Python not found. Install Python 3.10+ and restart VS Code.'; }
+  if (/exited with code/i.test(msg))             { return 'The agent crashed unexpectedly. Try a simpler task or run "ogacode doctor".'; }
+  if (/ECONNREFUSED|network|connection/i.test(msg)) { return "OgaCode's servers are temporarily busy. Check your connection and try again."; }
+  return msg;
+}
+
 export function runAgent(
   task: string,
   cwd: string,
@@ -168,6 +177,7 @@ export function runAgent(
   signal?: AbortSignal,
   serverUrl?: string,
   token?: string,
+  _retryCount = 0,
 ): Promise<AgentResult> {
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (serverUrl) { env['OGACODE_SERVER_URL'] = serverUrl; }
@@ -190,11 +200,28 @@ export function runAgent(
       }, { once: true });
     }
 
+    // Kill and retry once after 60s of silence (no stdout activity)
+    const resetSilenceTimer = () => {
+      clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        proc.kill();
+        if (_retryCount === 0) {
+          onEvent({ type: 'correction', msg: 'Agent timed out — retrying…' });
+          runAgent(task, cwd, onEvent, signal, serverUrl, token, 1).then(resolve).catch(reject);
+        } else {
+          reject(new Error('OgaCode is warming up — please wait 30 seconds and try again.'));
+        }
+      }, 60_000);
+    };
+    let silenceTimer: ReturnType<typeof setTimeout>;
+    resetSilenceTimer();
+
     let buffer = '';
     let stderrLog = '';
     let result: AgentResult = { success: false, summary: '', files: [] };
 
     proc.stdout.on('data', (chunk: Buffer) => {
+      resetSilenceTimer();
       buffer += chunk.toString('utf8');
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
@@ -227,21 +254,23 @@ export function runAgent(
     });
 
     proc.on('close', (code) => {
+      clearTimeout(silenceTimer);
       try { unlinkSync(taskFile); } catch { /* ignore cleanup failure */ }
       if (result.summary) {
         resolve(result);
       } else if (code !== 0) {
         const detail = stderrLog.trim().slice(0, 300);
         const hint = detail ? `\n\nDetails: ${detail}` : ' Run "pip install -e C:\\Users\\User\\OgaCode\\cli" to install OgaCode.';
-        reject(new Error(`OgaCode exited with code ${code ?? '?'}.${hint}`));
+        reject(new Error(friendlyError(`OgaCode exited with code ${code ?? '?'}.${hint}`)));
       } else {
         resolve(result);
       }
     });
 
     proc.on('error', () => {
+      clearTimeout(silenceTimer);
       reject(new Error(
-        'Cannot start Python. Make sure Python 3.10+ is installed and in PATH.'
+        'Python not found. Install Python 3.10+ from python.org and restart VS Code.'
       ));
     });
   });

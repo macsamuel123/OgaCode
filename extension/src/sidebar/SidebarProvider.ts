@@ -124,6 +124,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      if (!serverUrl || !token) {
+        this._send('chatError', { msg: 'OgaCode server not configured. Open Settings → Extensions → OgaCode and set your Server URL and Token.' });
+        return;
+      }
+
       this._abortController = new AbortController();
       this._isAgentRunning = true;
       try {
@@ -169,7 +174,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
         // Generate plan and wait for user approval before executing
         this._send('agentEvent', { type: 'thinking', step: 0, msg: 'Planning…' });
-        const plan = await getPlan(userPrompt, cwd, serverUrl || undefined, token || undefined);
+        const plan = await getPlan(enriched, cwd, serverUrl || undefined, token || undefined);
         const resolvedPlan = plan ?? {
           summary: `Complete: ${userPrompt.slice(0, 80)}`,
           steps: [
@@ -589,6 +594,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   private _send(command: string, data: Record<string, unknown>): void {
     this._view?.webview.postMessage({ command, ...data });
+    if (command === 'chatError') {
+      vscode.window.setStatusBarMessage(`⚠️ OgaCode: ${data['msg']}`, 8000);
+    }
   }
 
   private async _executeTask(
