@@ -157,6 +157,153 @@ export function readKeychain(keyName: string): string {
   }
 }
 
+export interface PlanThenRunHandle {
+  plan: Promise<PlanResult>;
+  approve: (steps?: string[]) => Promise<AgentResult>;
+  reject: () => void;
+  abort: () => void;
+}
+
+export function planThenRun(
+  task: string,
+  cwd: string,
+  serverUrl: string,
+  token: string,
+  onEvent: (evt: AgentEvent) => void,
+  signal?: AbortSignal,
+): PlanThenRunHandle {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  env['OGACODE_SERVER_URL'] = serverUrl;
+  env['OGACODE_TOKEN']      = token;
+
+  const taskFile = path.join(tmpdir(), `ogacode-merge-${Date.now()}.txt`);
+  writeFileSync(taskFile, task, 'utf8');
+
+  const proc = spawn(
+    'python', ['-m', 'ogacode.cli', '--merge', '--task-file', taskFile],
+    { cwd, env, windowsHide: true },
+  );
+
+  let stdoutBuffer = '';
+  let stderrLog = '';
+  let planResolve!: (value: PlanResult) => void;
+  let executeResolve!: (value: AgentResult) => void;
+  let executeReject!: (reason: Error) => void;
+  let planRejected = false;
+
+  const planPromise = new Promise<PlanResult>((resolve) => {
+    planResolve = resolve;
+  });
+
+  const abort = () => {
+    proc.kill('SIGTERM');
+    try { unlinkSync(taskFile); } catch { /* ignore */ }
+  };
+
+  if (signal) {
+    signal.addEventListener('abort', abort, { once: true });
+  }
+
+  let planParsed = false;
+
+  proc.stdout.on('data', (chunk: Buffer) => {
+    stdoutBuffer += chunk.toString('utf8');
+    const lines = stdoutBuffer.split('\n');
+    stdoutBuffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) { continue; }
+      try {
+        const evt = JSON.parse(trimmed) as Record<string, unknown>;
+        if (evt.type === 'plan' && !planParsed) {
+          planParsed = true;
+          planResolve({
+            summary: (evt['summary'] as string) ?? '',
+            steps: (evt['steps'] as string[]) ?? [],
+            components: (evt['components'] as PlanComponent[]) ?? [],
+            stepDetails: (evt['step_details'] as PlanStepDetail[]) ?? [],
+            isDefault: (evt['is_default'] as boolean) ?? false,
+          });
+        } else if (evt.type === 'complete') {
+          if (executeResolve) {
+            executeResolve({
+              success: (evt['success'] as boolean) ?? true,
+              summary: (evt['msg'] as string) ?? '',
+              files: (evt['files'] as string[]) ?? [],
+            });
+          }
+        } else if (evt.type === 'error') {
+          if (executeReject) {
+            executeReject(new Error((evt['msg'] as string) ?? 'Unknown error'));
+          }
+        } else if (evt.type === 'cancelled') {
+          if (executeReject && !planRejected) {
+            executeReject(new Error('Task cancelled by user.'));
+          }
+        } else if (evt.type !== 'plan') {
+          onEvent(evt as AgentEvent);
+        }
+      } catch { /* non-JSON line, skip */ }
+    }
+  });
+
+  proc.stderr.on('data', (chunk: Buffer) => {
+    const msg = chunk.toString('utf8').trim();
+    if (msg) {
+      stderrLog += msg + '\n';
+      if (/error|traceback|exception|fail|warning/i.test(msg)) {
+        onEvent({ type: 'correction', msg });
+      }
+    }
+  });
+
+  proc.on('close', (code) => {
+    try { unlinkSync(taskFile); } catch { /* ignore */ }
+    if (!planParsed) {
+      const detail = stderrLog.trim().slice(0, 300);
+      const errMsg = code !== 0 && detail
+        ? `Process exited with code ${code}: ${detail}`
+        : 'Failed to generate plan. Check your OgaCode token and server URL.';
+      planResolve({
+        summary: `Error: ${errMsg}`,
+        steps: ['Plan generation failed.'],
+        components: [], stepDetails: [], isDefault: true,
+      });
+    }
+  });
+
+  proc.on('error', (err) => {
+    try { unlinkSync(taskFile); } catch { /* ignore */ }
+    planResolve({
+      summary: `Error: ${err.message}`,
+      steps: ['Failed to start OgaCode.'],
+      components: [], stepDetails: [], isDefault: true,
+    });
+  });
+
+  const approve = (steps?: string[]): Promise<AgentResult> => {
+    return new Promise((resolve, reject) => {
+      executeResolve = resolve;
+      executeReject = reject;
+      const approval: Record<string, unknown> = { action: 'approve' };
+      if (steps && steps.length > 0) { approval.steps = steps; }
+      proc.stdin.write(JSON.stringify(approval) + '\n');
+    });
+  };
+
+  const reject = () => {
+    planRejected = true;
+    proc.stdin.write(JSON.stringify({ action: 'reject' }) + '\n');
+    setTimeout(() => {
+      try { proc.kill(); } catch { /* already dead */ }
+      try { unlinkSync(taskFile); } catch { /* ignore */ }
+    }, 2000);
+  };
+
+  return { plan: planPromise, approve, reject, abort };
+}
+
 /**
  * Spawns the OgaCode Python CLI as a subprocess.
  * Passes OGACODE_SERVER_URL + OGACODE_TOKEN so the CLI routes through the managed server.

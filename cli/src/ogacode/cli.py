@@ -59,6 +59,53 @@ def main() -> None:
                 }), flush=True)
                 return
 
+            # --merge: generate plan → wait for approval on stdin → execute in same process
+            if '--merge' in args:
+                import dataclasses
+                from ogacode.agent.events import EventBus
+                from ogacode.agent.listeners import make_audit_listener, make_console_listener
+                from ogacode.agent.loop import agent_loop, create_plan
+
+                p = asyncio.run(create_plan(task))
+                print(json.dumps({
+                    "type": "plan",
+                    "summary": p.summary,
+                    "steps": p.steps,
+                    "components": [dataclasses.asdict(c) for c in p.components],
+                    "step_details": [dataclasses.asdict(s) for s in p.step_details],
+                    "is_default": p.is_default,
+                }), flush=True)
+
+                line = sys.stdin.readline()
+                if not line:
+                    return
+                try:
+                    approval = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    return
+
+                if approval.get("action") != "approve":
+                    print(json.dumps({"type": "cancelled"}), flush=True)
+                    return
+
+                approved_steps = approval.get("steps")
+                if approved_steps:
+                    steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(approved_steps))
+                    task = f"[APPROVED PLAN — follow these steps in order]\n{steps_text}\n[END PLAN]\n\n{task}"
+
+                bus = EventBus()
+                bus.on_any(make_audit_listener())
+                bus.on_any(make_console_listener(console, as_json=True))
+
+                result = asyncio.run(agent_loop(task=task, cwd=Path.cwd(), bus=bus))
+                print(json.dumps({
+                    "type": "complete",
+                    "msg": result.summary,
+                    "success": result.success,
+                    "files": result.files_written,
+                }), flush=True)
+                return
+
             asyncio.run(_run(task, Path.cwd(), stream=stream, json_output=json_out,
                              offline=offline, plan_mode=plan))
             return

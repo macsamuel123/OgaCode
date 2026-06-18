@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { exec } from 'child_process';
-import { runAgent, AgentEvent, checkKeychainSetup, readKeychain, getPlan, PlanComponent, PlanStepDetail } from '../cli';
+import { runAgent, AgentEvent, checkKeychainSetup, readKeychain, getPlan, planThenRun, PlanThenRunHandle, PlanComponent, PlanStepDetail } from '../cli';
 import { PreviewPanel, ElementSelection } from '../preview/PreviewPanel';
 import { Turn, Memory, Chat } from './types';
 import { getSidebarHtml } from './getSidebarHtml';
@@ -20,6 +20,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _previewSelectionDisposable: vscode.Disposable | undefined;
   private _isAgentRunning = false;
   private _pendingPlan: { enriched: string; userTurn: Turn; chatId: string; history: Turn[]; cwd: string; serverUrl: string; token: string } | undefined;
+  private _mergeHandle: PlanThenRunHandle | undefined;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -172,9 +173,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         const enriched = enrichPrompt(userPrompt, cwd, history, this._getMemory());
         const userTurn: Turn = { role: 'user', content: message.prompt };
 
-        // Generate plan and wait for user approval before executing
+        // Generate plan using merged spawn — same process continues for execution
         this._send('agentEvent', { type: 'thinking', step: 0, msg: 'Planning…' });
-        const plan = await getPlan(enriched, cwd, serverUrl || undefined, token || undefined);
+
+        if (this._mergeHandle) { this._mergeHandle.abort(); }
+        const handle = planThenRun(
+          enriched, cwd, serverUrl, token,
+          (evt) => this._send('agentEvent', evt),
+          this._abortController?.signal,
+        );
+        this._mergeHandle = handle;
+
+        const plan = await handle.plan;
         const resolvedPlan = plan ?? {
           summary: `Complete: ${userPrompt.slice(0, 80)}`,
           steps: [
@@ -188,12 +198,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         };
         this._pendingPlan = { enriched, userTurn, chatId: activeChat.id, history, cwd, serverUrl, token };
         this._isAgentRunning = false;
+        this._send('unlockSend', {});
         this._send('showPlan', {
           summary: resolvedPlan.summary,
           steps: resolvedPlan.steps,
           components: resolvedPlan.components ?? [],
           stepDetails: resolvedPlan.stepDetails ?? [],
           isDefault: resolvedPlan.isDefault ?? false,
+          error: null,
         });
         return;
       } catch (err) {
@@ -203,31 +215,87 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // ── Plan approval ─────────────────────────────────────────────────────────
-    if (message.command === 'planApprove' && this._pendingPlan) {
+    // ── Plan approval — uses the merge handle (same process) ─────────────────
+    if (message.command === 'planApprove' && this._mergeHandle && this._pendingPlan) {
       const p = this._pendingPlan;
       this._pendingPlan = undefined;
-      this._abortController = new AbortController();
       this._isAgentRunning = true;
       try {
-        let enriched = p.enriched;
-        if (message.steps && message.steps.length > 0) {
-          const stepLines = message.steps.map((s, i) => {
-            const detail = message.stepDetails?.[i];
-            const verif = detail?.verification ? `\n   Verify: ${detail.verification}` : '';
-            return `${i + 1}. ${s}${verif}`;
-          }).join('\n');
-          enriched = '[APPROVED PLAN — follow these steps in order]\n' + stepLines + '\n[END PLAN]\n\n' + enriched;
+        const steps = (message.steps as string[])?.length > 0 ? (message.steps as string[]) : undefined;
+        const result = await this._mergeHandle.approve(steps);
+        this._mergeHandle = undefined;
+
+        const summary = result.summary || (result.success ? 'Done.' : 'Task finished with no summary.');
+
+        const assistantTurn: Turn = {
+          role: 'assistant',
+          content: result.files.length
+            ? `${summary}\nFiles touched: ${result.files.join(', ')}`
+            : summary,
+        };
+        await this._updateChatTurns(p.chatId, [...p.history, p.userTurn, assistantTurn]);
+
+        if (p.history.length === 0) {
+          await this._autoNameChat(p.chatId, p.userTurn.content);
+          this._send('chatNamed', { id: p.chatId, name: this._nameChatFromMessage(p.userTurn.content) });
         }
-        await this._executeTask(enriched, p.userTurn, p.chatId, p.history, p.userTurn.content, p.cwd, p.serverUrl, p.token);
+        this._isAgentRunning = false;
+        this._send('chatDone', { success: result.success, summary, files: result.files });
+
+        if (result.success && p.cwd) {
+          await autoReview(
+            p.enriched, summary, result.files, p.cwd,
+            p.serverUrl || undefined, p.token || undefined,
+            this._send.bind(this),
+          );
+        }
+        if (result.files.length > 0) {
+          vscode.commands.executeCommand('workbench.view.explorer');
+          vscode.window.setStatusBarMessage(`OgaCode: ${result.files.length} file(s) written`, 4000);
+          const touchedWeb = result.files.some(f => /\.(html|css|js|ts|jsx|tsx)$/.test(f));
+          if (touchedWeb && this._lastPreviewFile) {
+            setTimeout(() => PreviewPanel.show(this._getCwd(), this._lastPreviewFile!), 800);
+          }
+          const folder = this._getCwd();
+          const hasPackageJson = result.files.some(f => f.endsWith('package.json'));
+          const hasAppJson = result.files.some(f => f.endsWith('app.json') || f.endsWith('app.config.js'))
+            || (folder ? (await vscode.workspace.findFiles('app.json', '**/node_modules/**', 1)).length > 0 : false);
+          if (hasAppJson) { this._send('showExpobtn', {}); }
+          if (!hasPackageJson && folder) {
+            const pathModule = require('path') as typeof import('path');
+            const fs = require('fs') as typeof import('fs');
+            let htmlFile = result.files.find(f => f.endsWith('index.html') || f.endsWith('.html'));
+            if (htmlFile) {
+              const abs = pathModule.isAbsolute(htmlFile) ? htmlFile : pathModule.join(folder, htmlFile);
+              if (!fs.existsSync(abs)) { htmlFile = undefined; }
+            }
+            if (!htmlFile) {
+              const uris = await vscode.workspace.findFiles('**/index.html', '**/node_modules/**', 5);
+              if (uris.length) { htmlFile = pathModule.relative(folder, uris[0].fsPath); }
+            }
+            if (htmlFile) {
+              this._lastPreviewFile = htmlFile;
+              PreviewPanel.show(folder, htmlFile);
+              this._send('staticReady', { file: htmlFile });
+            } else if (this._lastPreviewFile) {
+              PreviewPanel.show(folder, this._lastPreviewFile);
+            }
+          }
+        }
       } catch (err) {
         this._isAgentRunning = false;
+        this._mergeHandle = undefined;
+        this._pendingPlan = undefined;
         this._send('chatError', { msg: err instanceof Error ? err.message : 'Unknown error' });
       }
       return;
     }
 
     if (message.command === 'planReject') {
+      if (this._mergeHandle) {
+        this._mergeHandle.reject();
+        this._mergeHandle = undefined;
+      }
       this._pendingPlan = undefined;
       this._isAgentRunning = false;
       this._send('chatDone', { success: false, summary: 'Task cancelled.', files: [] });
@@ -242,7 +310,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         ? `${p.userTurn.content}\n\n[User clarification]: ${clarification}`
         : p.userTurn.content;
       try {
-        const newPlan = await getPlan(refinedPrompt, p.cwd, p.serverUrl || undefined, p.token || undefined);
+        const enriched = enrichPrompt(refinedPrompt, p.cwd, p.history, this._getMemory());
+
+        if (this._mergeHandle) { this._mergeHandle.abort(); }
+        const handle = planThenRun(
+          enriched, p.cwd, p.serverUrl, p.token,
+          (evt) => this._send('agentEvent', evt),
+          this._abortController?.signal,
+        );
+        this._mergeHandle = handle;
+
+        const newPlan = await handle.plan;
         const resolvedNewPlan = newPlan ?? {
           summary: `Complete: ${refinedPrompt.slice(0, 80)}`,
           steps: ['Read and understand relevant files', 'Implement the changes', 'Verify the result'],
@@ -250,13 +328,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           stepDetails: [] as PlanStepDetail[],
           isDefault: true,
         };
-        this._pendingPlan = { ...p, enriched: enrichPrompt(refinedPrompt, p.cwd, p.history, this._getMemory()) };
+        this._pendingPlan = { ...p, enriched };
         this._send('showPlanUpdate', {
           summary: resolvedNewPlan.summary,
           steps: resolvedNewPlan.steps,
           components: resolvedNewPlan.components ?? [],
           stepDetails: resolvedNewPlan.stepDetails ?? [],
           isDefault: resolvedNewPlan.isDefault ?? false,
+          error: null,
         });
       } catch (err) {
         this._pendingPlan = undefined;

@@ -84,6 +84,7 @@ File editing rules:
 - Never create or read binary files (images, fonts, compiled files). Use CSS/SVG/base64 for graphics.
 - Skip any image or binary file you encounter.
 - NEVER call write_file(), open(), or any Python function inside bash_exec to write a file.
+  Do NOT use PowerShell file-writing cmdlets (Set-Content, Out-File, Add-Content, New-Item -Value) either.
   To create a file use: file_edit action='create'. bash_exec is for shell commands only (python script.py, npm install, etc.).
 
 Efficiency rules:
