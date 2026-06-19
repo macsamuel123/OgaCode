@@ -42,7 +42,7 @@ export function enrichPrompt(prompt: string, cwd: string, history: Turn[], memor
   if (memory.rules)  { parts.push(`[PROJECT RULES]\n${memory.rules}`); }
   if (memory.skills) { parts.push(`[PROJECT SKILLS]\n${memory.skills}`); }
 
-  const recentTurns = history.slice(-8);
+  const recentTurns = history.slice(-4);
   if (recentTurns.length > 0) {
     const historyText = recentTurns
       .map(t => `${t.role === 'user' ? 'User' : 'Assistant'}: ${t.content}`)
@@ -59,7 +59,7 @@ export function enrichPrompt(prompt: string, cwd: string, history: Turn[], memor
 
   const doc = editor.document;
   const relPath = path.relative(cwd, doc.uri.fsPath);
-  const content = doc.getText().slice(0, 6000);
+  const content = doc.getText().slice(0, 2000);
 
   const diagnostics = vscode.languages.getDiagnostics(doc.uri)
     .filter(d => d.severity === vscode.DiagnosticSeverity.Error)

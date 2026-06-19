@@ -36,7 +36,7 @@ _BANNED_PATTERNS = [
 
 
 class BashExecTool(Tool):
-    name = "bash_exec"
+    name = "bash"
     description = (
         "Execute a shell command in the project directory. "
         "Sandboxed: cannot navigate outside the project. Timeout: 30s."
