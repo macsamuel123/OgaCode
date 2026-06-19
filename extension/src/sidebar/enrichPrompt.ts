@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { Turn, Memory } from './types';
 
-const NIGERIAN_CONTEXT =
+const NIGERIAN_DEV_CONTEXT =
   '[NIGERIAN DEVELOPER CONTEXT]\n' +
   'You are assisting a Nigerian developer. Always recommend free or low-cost tools first:\n' +
   '- Database/Backend: Supabase (supabase.com) is FREE for small projects — 500MB database,\n' +
@@ -12,9 +12,10 @@ const NIGERIAN_CONTEXT =
   '- Static hosting: Netlify or Vercel (both free, no credit card for basic use).\n' +
   '- Backend hosting: Railway free tier or Render free tier.\n' +
   '- Never recommend a paid service as the primary option without explaining the free alternative.\n' +
-  '- When mentioning Supabase, always add: "Supabase is free — you will not be charged."\n' +
-  '\n' +
-  '[DESIGN REQUIREMENTS — MANDATORY FOR ALL WEB PROJECTS]\n' +
+  '- When mentioning Supabase, always add: "Supabase is free — you will not be charged."';
+
+const WEB_DESIGN_CONTEXT =
+  '[DESIGN REQUIREMENTS — FOR WEB PROJECTS]\n' +
   'Every website or web app you build MUST look professional and modern. Never ship plain unstyled HTML.\n' +
   'Always include:\n' +
   '- A coherent color scheme: pick a primary color and use consistent shades throughout.\n' +
@@ -30,8 +31,13 @@ const NIGERIAN_CONTEXT =
   'Think: "Would this impress a client?" If not, add more design. A developer\'s reputation depends on\n' +
   'how their work looks. Beautiful design is not optional — it is part of the deliverable.';
 
+const WEB_KEYWORDS = /\b(website|web app|webpage|html|css|react|vue|angular|svelte|frontend|front.end|landing page|landing-page|ui|user interface|design|dashboard|portfolio|navbar|tailwind|bootstrap|nextjs|next\.js|nuxt|astro)\b/i;
+
 export function enrichPrompt(prompt: string, cwd: string, history: Turn[], memory: Memory): string {
-  const parts: string[] = [NIGERIAN_CONTEXT];
+  const parts: string[] = [NIGERIAN_DEV_CONTEXT];
+  if (WEB_KEYWORDS.test(prompt)) {
+    parts.push(WEB_DESIGN_CONTEXT);
+  }
   if (memory.prd)    { parts.push(`[PROJECT PRD]\n${memory.prd}`); }
   if (memory.rules)  { parts.push(`[PROJECT RULES]\n${memory.rules}`); }
   if (memory.skills) { parts.push(`[PROJECT SKILLS]\n${memory.skills}`); }

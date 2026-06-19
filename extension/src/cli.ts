@@ -186,6 +186,7 @@ export function planThenRun(
 
   let stdoutBuffer = '';
   let stderrLog = '';
+  let lastEventTime = Date.now();
   let planResolve!: (value: PlanResult) => void;
   let executeResolve!: (value: AgentResult) => void;
   let executeReject!: (reason: Error) => void;
@@ -207,6 +208,7 @@ export function planThenRun(
   let planParsed = false;
 
   proc.stdout.on('data', (chunk: Buffer) => {
+    lastEventTime = Date.now();
     stdoutBuffer += chunk.toString('utf8');
     const lines = stdoutBuffer.split('\n');
     stdoutBuffer = lines.pop() ?? '';
@@ -289,6 +291,16 @@ export function planThenRun(
       const approval: Record<string, unknown> = { action: 'approve' };
       if (steps && steps.length > 0) { approval.steps = steps; }
       proc.stdin.write(JSON.stringify(approval) + '\n');
+
+      // Heartbeat: emit "Still working…" if no stdout for 90s (prevents UI looking frozen)
+      lastEventTime = Date.now();
+      const heartbeat = setInterval(() => {
+        if (Date.now() - lastEventTime > 90_000) {
+          onEvent({ type: 'thinking', step: 0, msg: 'Still working…' });
+          lastEventTime = Date.now();
+        }
+      }, 30_000);
+      proc.on('close', () => clearInterval(heartbeat));
     });
   };
 
