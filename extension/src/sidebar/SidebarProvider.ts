@@ -1,13 +1,14 @@
 import * as vscode from 'vscode';
 import { exec } from 'child_process';
-import { runAgent, AgentEvent, checkKeychainSetup, readKeychain, getPlan, planThenRun, PlanThenRunHandle, PlanComponent, PlanStepDetail } from '../cli';
+import { AgentEvent, checkKeychainSetup, readKeychain, planThenRun, PlanThenRunHandle, PlanComponent, PlanStepDetail } from '../cli';
 import { PreviewPanel, ElementSelection } from '../preview/PreviewPanel';
-import { Turn, Memory, Chat } from './types';
+import { Turn, Chat } from './types';
 import { getSidebarHtml } from './getSidebarHtml';
-import { enrichPrompt } from './enrichPrompt';
 import { describeImage } from './describeImage';
 import { autoReview } from './review';
 import { deployToNetlify } from './deploy';
+
+// enrichPrompt removed — tasks pass directly to CLI without modification
 
 const CHATS_KEY = 'ogacode.chats.v2';
 const ACTIVE_CHAT_KEY = 'ogacode.activeChatId';
@@ -19,26 +20,27 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _selectedElement: ElementSelection | undefined;
   private _previewSelectionDisposable: vscode.Disposable | undefined;
   private _isAgentRunning = false;
-  private _pendingPlan: { enriched: string; userTurn: Turn; chatId: string; history: Turn[]; cwd: string; serverUrl: string; token: string } | undefined;
+
+  // Execution tracking (reset on each new task)
+  private _filesThisRun: string[] = [];
+  private _stepCount = 0;
+  private _startTime = 0;
+
+  private _pendingPlan: {
+    task: string;
+    userTurn: Turn;
+    chatId: string;
+    history: Turn[];
+    cwd: string;
+    serverUrl: string;
+    token: string;
+  } | undefined;
   private _mergeHandle: PlanThenRunHandle | undefined;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
     private readonly _ctx: vscode.ExtensionContext,
   ) {}
-
-  private _memoryKey(): string {
-    const cwd = this._getCwd();
-    return cwd ? `ogacode.memory.${cwd}` : 'ogacode.memory.__global';
-  }
-
-  private _getMemory(): Memory {
-    return this._ctx.globalState.get<Memory>(this._memoryKey()) ?? { prd: '', rules: '', skills: '' };
-  }
-
-  private async _saveMemory(mem: Memory): Promise<void> {
-    await this._ctx.globalState.update(this._memoryKey(), mem);
-  }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this._view = webviewView;
@@ -48,17 +50,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = getSidebarHtml(webviewView.webview, this._extensionUri);
     webviewView.webview.onDidReceiveMessage(this._handleMessage.bind(this));
-    // Restore the last active chat so thread + historyBtn are correct on reload
-    setTimeout(() => {
-      const chat = this._getActiveChat();
-      if (chat && chat.turns.length > 0) {
-        this._send('chatLoaded', { turns: chat.turns, chatName: chat.name, chatId: chat.id });
-      } else if (chat) {
-        this._send('chatNamed', { id: chat.id, name: chat.name });
-      }
-    }, 200);
 
-    // Show onboarding if managed mode is configured but no token is set yet
+    // Show onboarding if server URL configured but no token yet
     const cfg2 = vscode.workspace.getConfiguration('ogacode');
     const hasServerUrl = cfg2.get<string>('serverUrl', '').trim().length > 0;
     const hasToken     = cfg2.get<string>('token', '').trim().length > 0;
@@ -66,17 +59,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this._send('showOnboarding', {});
     }
 
-    // Re-enable send button and focus input when sidebar becomes visible.
-    // The WebviewView HTML persists across hide/show (retainContextWhenHidden: true),
-    // so a button stuck disabled from a crashed agent stays broken without this.
     webviewView.onDidChangeVisibility(() => {
-      if (webviewView.visible) {
-        if (!this._isAgentRunning) { this._send('unlockSend', {}); }
-        this._send('focusInput', {});
+      if (webviewView.visible && !this._isAgentRunning) {
+        this._send('unlockSend', {});
       }
     });
 
-    // Subscribe to element clicks from the PreviewPanel
     this._previewSelectionDisposable?.dispose();
     this._previewSelectionDisposable = PreviewPanel.onElementSelected((data) => {
       this._selectedElement = data;
@@ -98,13 +86,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     cmd?: string;
     url?: string;
     subdir?: string;
-    files?: Array<{ path: string; content: string }>;
     slot?: string;
-    prd?: string;
-    rules?: string;
-    skills?: string;
     steps?: string[];
-    stepDetails?: PlanStepDetail[];
+    clarification?: string;
+    filePath?: string;
   }): Promise<void> {
 
     // ── Run agent task ────────────────────────────────────────────────────────
@@ -132,9 +117,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
       this._abortController = new AbortController();
       this._isAgentRunning = true;
+
       try {
         const activeChat = await this._ensureActiveChat();
-        const history = activeChat.turns;
         let userPrompt = message.prompt;
 
         // Inject selected element context so agent edits exactly the right element
@@ -149,37 +134,46 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           this._selectedElement = undefined;
         }
 
+        // Image description (design reference or debug screenshot)
         if (message.image) {
           const isDesignRef = /\b(build|create|make|design|replicate|match|clone|copy)\b/i.test(userPrompt);
-          const purpose = isDesignRef ? 'design' : 'debug';
           this._send('agentEvent', { type: 'thinking', step: 0, msg: isDesignRef ? 'Analysing design reference…' : 'Analysing screenshot…' });
           const groqKey = readKeychain('groq_api_key');
-          const description = await describeImage(message.image, purpose, groqKey, serverUrl, token);
+          const description = await describeImage(message.image, isDesignRef ? 'design' : 'debug', groqKey, serverUrl, token);
           if (description) {
-            if (isDesignRef) {
-              userPrompt =
-                `[DESIGN REFERENCE — MATCH THIS EXACTLY]\n` +
-                `The user has provided a screenshot of the design they want. ` +
-                `Your #1 priority is to replicate this design as faithfully as possible.\n` +
-                `Do not invent a different color scheme, layout, or style — use what is described below.\n\n` +
-                `Design analysis:\n${description}\n\n` +
-                `[END DESIGN REFERENCE]\n\n${userPrompt}`;
-            } else {
-              userPrompt = `[Screenshot attached — vision analysis:\n${description}]\n\n${userPrompt}`;
-            }
+            userPrompt = isDesignRef
+              ? `[DESIGN REFERENCE — MATCH THIS EXACTLY]\nDesign analysis:\n${description}\n[END DESIGN REFERENCE]\n\n${userPrompt}`
+              : `[Screenshot attached — vision analysis:\n${description}]\n\n${userPrompt}`;
           }
         }
 
-        const enriched = enrichPrompt(userPrompt, cwd, history, this._getMemory());
+        // Pass task DIRECTLY to CLI — no enrichment, no injection
         const userTurn: Turn = { role: 'user', content: message.prompt };
 
-        // Generate plan using merged spawn — same process continues for execution
         this._send('agentEvent', { type: 'thinking', step: 0, msg: 'Planning…' });
 
         if (this._mergeHandle) { this._mergeHandle.abort(); }
+
         const handle = planThenRun(
-          enriched, cwd, serverUrl, token,
-          (evt) => this._send('agentEvent', evt),
+          userPrompt,
+          cwd,
+          serverUrl,
+          token,
+          (evt: AgentEvent) => {
+            // Track files created during execution
+            if (evt.type === 'pre_tool_use') {
+              const e = evt as Record<string, unknown>;
+              if (e['tool'] === 'file_edit') {
+                const args = e['args'] as Record<string, unknown> | undefined;
+                const fp = (args?.['path'] ?? args?.['file_path']) as string | undefined;
+                if (fp && !this._filesThisRun.includes(fp)) {
+                  this._filesThisRun.push(fp);
+                }
+              }
+            }
+            if (evt.type === 'thinking') { this._stepCount++; }
+            this._send('agentEvent', evt);
+          },
           this._abortController?.signal,
         );
         this._mergeHandle = handle;
@@ -196,16 +190,23 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           stepDetails: [] as PlanStepDetail[],
           isDefault: true,
         };
-        this._pendingPlan = { enriched, userTurn, chatId: activeChat.id, history, cwd, serverUrl, token };
+
+        this._pendingPlan = {
+          task: userPrompt,
+          userTurn,
+          chatId: activeChat.id,
+          history: activeChat.turns,
+          cwd,
+          serverUrl,
+          token,
+        };
         this._isAgentRunning = false;
-        this._send('unlockSend', {});
         this._send('showPlan', {
           summary: resolvedPlan.summary,
           steps: resolvedPlan.steps,
           components: resolvedPlan.components ?? [],
           stepDetails: resolvedPlan.stepDetails ?? [],
           isDefault: resolvedPlan.isDefault ?? false,
-          error: null,
         });
         return;
       } catch (err) {
@@ -215,22 +216,30 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // ── Plan approval — uses the merge handle (same process) ─────────────────
+    // ── Plan approval ─────────────────────────────────────────────────────────
     if (message.command === 'planApprove' && this._mergeHandle && this._pendingPlan) {
       const p = this._pendingPlan;
       this._pendingPlan = undefined;
       this._isAgentRunning = true;
+
+      // Reset tracking for this execution
+      this._filesThisRun = [];
+      this._stepCount = 0;
+      this._startTime = Date.now();
+
       try {
         const steps = (message.steps as string[])?.length > 0 ? (message.steps as string[]) : undefined;
         const result = await this._mergeHandle.approve(steps);
         this._mergeHandle = undefined;
 
+        const elapsed = Date.now() - this._startTime;
         const summary = result.summary || (result.success ? 'Done.' : 'Task finished with no summary.');
+        const allFiles = result.files.length ? result.files : this._filesThisRun;
 
         const assistantTurn: Turn = {
           role: 'assistant',
-          content: result.files.length
-            ? `${summary}\nFiles touched: ${result.files.join(', ')}`
+          content: allFiles.length
+            ? `${summary}\nFiles: ${allFiles.join(', ')}`
             : summary,
         };
         await this._updateChatTurns(p.chatId, [...p.history, p.userTurn, assistantTurn]);
@@ -239,32 +248,38 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           await this._autoNameChat(p.chatId, p.userTurn.content);
           this._send('chatNamed', { id: p.chatId, name: this._nameChatFromMessage(p.userTurn.content) });
         }
+
         this._isAgentRunning = false;
-        this._send('chatDone', { success: result.success, summary, files: result.files });
+        this._send('chatDone', {
+          success: result.success,
+          summary,
+          files: allFiles,
+          steps: this._stepCount,
+          elapsed,
+        });
 
         if (result.success && p.cwd) {
           await autoReview(
-            p.enriched, summary, result.files, p.cwd,
+            p.task, summary, allFiles, p.cwd,
             p.serverUrl || undefined, p.token || undefined,
             this._send.bind(this),
           );
         }
-        if (result.files.length > 0) {
+
+        if (allFiles.length > 0) {
           vscode.commands.executeCommand('workbench.view.explorer');
-          vscode.window.setStatusBarMessage(`OgaCode: ${result.files.length} file(s) written`, 4000);
-          const touchedWeb = result.files.some(f => /\.(html|css|js|ts|jsx|tsx)$/.test(f));
-          if (touchedWeb && this._lastPreviewFile) {
-            setTimeout(() => PreviewPanel.show(this._getCwd(), this._lastPreviewFile!), 800);
-          }
-          const folder = this._getCwd();
-          const hasPackageJson = result.files.some(f => f.endsWith('package.json'));
-          const hasAppJson = result.files.some(f => f.endsWith('app.json') || f.endsWith('app.config.js'))
-            || (folder ? (await vscode.workspace.findFiles('app.json', '**/node_modules/**', 1)).length > 0 : false);
+          vscode.window.setStatusBarMessage(`OgaCode: ${allFiles.length} file(s) written`, 4000);
+
+          const pathModule = require('path') as typeof import('path');
+          const fs = require('fs') as typeof import('fs');
+          const folder = p.cwd;
+          const hasPackageJson = allFiles.some(f => f.endsWith('package.json'));
+          const hasAppJson = allFiles.some(f => f.endsWith('app.json') || f.endsWith('app.config.js'))
+            || ((await vscode.workspace.findFiles('app.json', '**/node_modules/**', 1)).length > 0);
           if (hasAppJson) { this._send('showExpobtn', {}); }
+
           if (!hasPackageJson && folder) {
-            const pathModule = require('path') as typeof import('path');
-            const fs = require('fs') as typeof import('fs');
-            let htmlFile = result.files.find(f => f.endsWith('index.html') || f.endsWith('.html'));
+            let htmlFile = allFiles.find(f => f.endsWith('index.html') || f.endsWith('.html'));
             if (htmlFile) {
               const abs = pathModule.isAbsolute(htmlFile) ? htmlFile : pathModule.join(folder, htmlFile);
               if (!fs.existsSync(abs)) { htmlFile = undefined; }
@@ -298,23 +313,25 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       }
       this._pendingPlan = undefined;
       this._isAgentRunning = false;
-      this._send('chatDone', { success: false, summary: 'Task cancelled.', files: [] });
+      this._send('chatDone', { success: false, summary: 'Task cancelled.', files: [], steps: 0, elapsed: 0 });
       return;
     }
 
-    // ── Plan clarification — regenerate plan with user's feedback ─────────────
+    // ── Plan clarification ────────────────────────────────────────────────────
     if (message.command === 'planClarify' && this._pendingPlan) {
       const p = this._pendingPlan;
-      const clarification = ((message as unknown as { clarification?: string }).clarification ?? '').trim();
-      const refinedPrompt = clarification
-        ? `${p.userTurn.content}\n\n[User clarification]: ${clarification}`
-        : p.userTurn.content;
-      try {
-        const enriched = enrichPrompt(refinedPrompt, p.cwd, p.history, this._getMemory());
+      const clarification = (message.clarification ?? '').trim();
+      const refinedTask = clarification
+        ? `${p.task}\n\n[User clarification]: ${clarification}`
+        : p.task;
 
+      try {
         if (this._mergeHandle) { this._mergeHandle.abort(); }
         const handle = planThenRun(
-          enriched, p.cwd, p.serverUrl, p.token,
+          refinedTask,
+          p.cwd,
+          p.serverUrl,
+          p.token,
           (evt) => this._send('agentEvent', evt),
           this._abortController?.signal,
         );
@@ -322,26 +339,73 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
         const newPlan = await handle.plan;
         const resolvedNewPlan = newPlan ?? {
-          summary: `Complete: ${refinedPrompt.slice(0, 80)}`,
+          summary: `Complete: ${refinedTask.slice(0, 80)}`,
           steps: ['Read and understand relevant files', 'Implement the changes', 'Verify the result'],
           components: [] as PlanComponent[],
           stepDetails: [] as PlanStepDetail[],
           isDefault: true,
         };
-        this._pendingPlan = { ...p, enriched };
+        this._pendingPlan = { ...p, task: refinedTask };
         this._send('showPlanUpdate', {
           summary: resolvedNewPlan.summary,
           steps: resolvedNewPlan.steps,
           components: resolvedNewPlan.components ?? [],
           stepDetails: resolvedNewPlan.stepDetails ?? [],
           isDefault: resolvedNewPlan.isDefault ?? false,
-          error: null,
         });
       } catch (err) {
         this._pendingPlan = undefined;
         this._isAgentRunning = false;
         this._send('chatError', { msg: err instanceof Error ? err.message : 'Unknown error' });
       }
+      return;
+    }
+
+    // ── File utilities ────────────────────────────────────────────────────────
+    if (message.command === 'openFile' && message.filePath) {
+      try {
+        const uri = vscode.Uri.file(message.filePath);
+        const doc = await vscode.workspace.openTextDocument(uri);
+        await vscode.window.showTextDocument(doc);
+      } catch { /* file may not exist yet */ }
+      return;
+    }
+
+    if (message.command === 'revealInExplorer' && message.filePath) {
+      try {
+        const uri = vscode.Uri.file(message.filePath);
+        vscode.commands.executeCommand('revealInExplorer', uri);
+      } catch { /* ignore */ }
+      return;
+    }
+
+    if (message.command === 'pickFile') {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFiles: true, canSelectFolders: false, canSelectMany: false,
+        openLabel: 'Attach', title: 'Attach a file to your prompt',
+      });
+      if (!picked?.[0]) { return; }
+      try {
+        const raw = await vscode.workspace.fs.readFile(picked[0]);
+        const content = Buffer.from(raw).toString('utf8').slice(0, 8000);
+        const name = picked[0].path.split('/').pop() ?? 'file';
+        this._send('filePicked', { file: { name, content } });
+      } catch {
+        this._send('filePicked', { file: null });
+      }
+      return;
+    }
+
+    if (message.command === 'preview') {
+      const folder = this._getCwd();
+      if (!folder) { return; }
+      const uris = await vscode.workspace.findFiles('**/*.html', '**/node_modules/**', 10);
+      if (!uris.length) {
+        this._send('chatError', { msg: 'No HTML files found in this project.' });
+        return;
+      }
+      const path = require('path') as typeof import('path');
+      PreviewPanel.show(folder, path.relative(folder, uris[0].fsPath));
       return;
     }
 
@@ -363,17 +427,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           this._send('devServerReady', {});
           vscode.commands.executeCommand('simpleBrowser.show', 'http://localhost:3000');
         });
-        req.on('error', () => { /* not ready yet */ });
+        req.on('error', () => {});
         req.end();
-        if (attempts > 90) {
-          clearInterval(poll);
-          this._send('devServerError', { error: 'Timed out waiting for server' });
-        }
+        if (attempts > 90) { clearInterval(poll); this._send('devServerError', { error: 'Timed out' }); }
       }, 1000);
       return;
     }
 
-    // ── Expo / React Native ───────────────────────────────────────────────────
     if (message.command === 'runExpo') {
       const folder = this._getCwd();
       if (!folder) { this._send('expoError', { error: 'No workspace open' }); return; }
@@ -401,15 +461,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         });
         req.on('error', () => {});
         req.end();
-        if (expoAttempts > 90) {
-          clearInterval(expoPoll);
-          this._send('expoError', { error: 'Timed out waiting for Expo' });
-        }
+        if (expoAttempts > 90) { clearInterval(expoPoll); this._send('expoError', { error: 'Timed out' }); }
       }, 1000);
       return;
     }
 
-    // ── Terminal / shell commands ─────────────────────────────────────────────
+    // ── Shell / terminal ──────────────────────────────────────────────────────
     if (message.command === 'openTerminal' && message.cmd) {
       const terminal = vscode.window.createTerminal({ name: 'OgaCode' });
       terminal.show();
@@ -429,94 +486,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // ── File utilities ────────────────────────────────────────────────────────
-    if (message.command === 'listFiles') {
-      const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
-      if (!folder) { this._send('fileList', { files: [] }); return; }
-      try {
-        const uris = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,py,html,css,json,md}', '**/node_modules/**', 60);
-        this._send('fileList', { files: uris.map(u => vscode.workspace.asRelativePath(u)) });
-      } catch {
-        this._send('fileList', { files: [] });
-      }
-      return;
-    }
-
-    if (message.command === 'pickFile') {
-      const picked = await vscode.window.showOpenDialog({
-        canSelectFiles: true, canSelectFolders: false, canSelectMany: false,
-        openLabel: 'Attach', title: 'Attach a file to your prompt',
-      });
-      if (!picked?.[0]) { return; }
-      try {
-        const raw = await vscode.workspace.fs.readFile(picked[0]);
-        const content = Buffer.from(raw).toString('utf8').slice(0, 8000);
-        const name = picked[0].path.split('/').pop() ?? 'file';
-        this._send('filePicked', { file: { name, content } });
-      } catch {
-        this._send('filePicked', { file: null });
-      }
-      return;
-    }
-
-    if (message.command === 'newChat') {
-      const chat = await this._createNewChat();
-      this._send('chatCleared', { chatId: chat.id, chatName: chat.name });
-      return;
-    }
-
-    if (message.command === 'listChats') {
-      const chats = this._getAllChats().sort(
-        (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-      );
-      const activeChatId = this._ctx.globalState.get<string>(ACTIVE_CHAT_KEY) ?? '';
-      this._send('chatList', { chats, activeChatId });
-      return;
-    }
-
-    if (message.command === 'switchChat' && message.prompt) {
-      const chatId = message.prompt;
-      await this._ctx.globalState.update(ACTIVE_CHAT_KEY, chatId);
-      const chat = this._getAllChats().find(c => c.id === chatId);
-      if (chat) {
-        this._send('chatLoaded', { turns: chat.turns, chatName: chat.name, chatId: chat.id });
-      }
-      return;
-    }
-
-    if (message.command === 'renameChat' && message.prompt && message.slot) {
-      const chatId = message.prompt;
-      const name = message.slot;
-      const chats = this._getAllChats().map(c => c.id === chatId ? { ...c, name } : c);
-      await this._saveAllChats(chats);
-      this._send('chatRenamed', { chatId, name });
-      return;
-    }
-
-    if (message.command === 'deleteChat' && message.prompt) {
-      const chatId = message.prompt;
-      let chats = this._getAllChats().filter(c => c.id !== chatId);
-      const activeChatId = this._ctx.globalState.get<string>(ACTIVE_CHAT_KEY);
-      let nextChat: Chat | undefined;
-      if (activeChatId === chatId) {
-        nextChat = chats[0] ?? await this._createNewChat();
-        if (!chats.length) { chats = this._getAllChats(); }
-        await this._ctx.globalState.update(ACTIVE_CHAT_KEY, nextChat.id);
-      }
-      await this._saveAllChats(chats);
-      const active = nextChat ?? this._getAllChats().find(c => c.id === this._ctx.globalState.get<string>(ACTIVE_CHAT_KEY));
-      this._send('chatDeleted', { turns: active?.turns ?? [], chatName: active?.name ?? 'New Chat' });
-      return;
-    }
-
+    // ── Deploy ────────────────────────────────────────────────────────────────
     if (message.command === 'deploy') {
       const folder = this._getCwd();
       if (!folder) { this._send('deployError', { msg: 'No workspace open.' }); return; }
-      const token = readKeychain('netlify_token');
-      if (!token) { this._send('showDeploySetup', {}); return; }
+      const netlifyToken = readKeychain('netlify_token');
+      if (!netlifyToken) { this._send('showDeploySetup', {}); return; }
       this._send('deployStatus', { msg: 'Zipping project…' });
       try {
-        const url = await deployToNetlify(folder, token);
+        const url = await deployToNetlify(folder, netlifyToken);
         this._send('deployDone', { url });
       } catch (err) {
         this._send('deployError', { msg: err instanceof Error ? err.message : 'Deploy failed.' });
@@ -533,7 +511,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           `python -c "import keyring; keyring.set_password('ogacode','netlify_token','${safeToken}')"`,
           { timeout: 5000, stdio: 'pipe' }
         );
-      } catch { /* keychain write failed — still try the deploy with the raw token */ }
+      } catch { /* ignore */ }
       const folder = this._getCwd();
       if (!folder) { this._send('deployError', { msg: 'No workspace open.' }); return; }
       this._send('deployStatus', { msg: 'Zipping project…' });
@@ -546,11 +524,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    if (message.command === 'clearElement') {
-      this._selectedElement = undefined;
-      return;
-    }
-
+    // ── Auth ──────────────────────────────────────────────────────────────────
     if (message.command === 'saveToken') {
       const t = ((message as unknown as { token: string }).token || '').trim();
       if (!t) { this._send('onboardErr', { msg: 'Please enter your access code.' }); return; }
@@ -571,53 +545,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    if (message.command === 'preview') {
-      const folder = this._getCwd();
-      if (!folder) { return; }
-      const uris = await vscode.workspace.findFiles('**/*.html', '**/node_modules/**', 10);
-      if (!uris.length) {
-        this._send('chatError', { msg: 'No HTML files found in this project.' });
-        return;
-      }
-      const path = require('path') as typeof import('path');
-      const htmlFile = path.relative(folder, uris[0].fsPath);
-      PreviewPanel.show(folder, htmlFile);
-      return;
-    }
-
-    if (message.command === 'loadMemory') {
-      const mem = this._getMemory();
-      this._send('memoryLoaded', { prd: mem.prd, rules: mem.rules, skills: mem.skills });
-      return;
-    }
-
-    if (message.command === 'saveMemory') {
-      await this._saveMemory({
-        prd: message.prd ?? '',
-        rules: message.rules ?? '',
-        skills: message.skills ?? '',
-      });
-      this._send('memorySaved', {});
-      return;
-    }
-
-    if (message.command === 'pickMemoryFile') {
-      const picked = await vscode.window.showOpenDialog({
-        canSelectFiles: true, canSelectFolders: false, canSelectMany: false,
-        openLabel: 'Load', title: 'Load file into memory slot',
-        filters: { 'Text files': ['md', 'txt', 'json', 'yaml', 'toml', 'ts', 'js', 'py'] },
-      });
-      if (!picked?.[0]) { return; }
-      try {
-        const raw = await vscode.workspace.fs.readFile(picked[0]);
-        const content = Buffer.from(raw).toString('utf8').slice(0, 8000);
-        this._send('memoryFilePicked', { slot: message.slot, content });
-      } catch {
-        // silently ignore read errors
-      }
+    if (message.command === 'clearElement') {
+      this._selectedElement = undefined;
       return;
     }
   }
+
+  // ── Chat storage helpers ──────────────────────────────────────────────────
 
   private _getAllChats(): Chat[] {
     return this._ctx.globalState.get<Chat[]>(CHATS_KEY) ?? [];
@@ -675,94 +609,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ command, ...data });
     if (command === 'chatError') {
       vscode.window.setStatusBarMessage(`⚠️ OgaCode: ${data['msg']}`, 8000);
-    }
-  }
-
-  private async _executeTask(
-    enriched: string,
-    userTurn: Turn,
-    chatId: string,
-    history: Turn[],
-    originalPrompt: string,
-    cwd: string,
-    serverUrl: string,
-    token: string,
-  ): Promise<void> {
-    const filesWritten: string[] = [];
-    const result = await runAgent(
-      enriched,
-      cwd,
-      (evt: AgentEvent) => {
-        if (evt.type === 'pre_tool_use') {
-          const args = (evt as { args?: Record<string, unknown> }).args;
-          const fp = (args?.file_path ?? args?.path) as string | undefined;
-          if (fp && !filesWritten.includes(fp)) { filesWritten.push(fp); }
-        }
-        this._send('agentEvent', evt);
-      },
-      this._abortController!.signal,
-      serverUrl || undefined,
-      token || undefined,
-    );
-
-    const summary = result.summary || (result.success ? 'Done.' : 'Task finished with no summary.');
-    const assistantTurn: Turn = {
-      role: 'assistant',
-      content: result.files.length
-        ? `${summary}\nFiles touched: ${result.files.join(', ')}`
-        : summary,
-    };
-    await this._updateChatTurns(chatId, [...history, userTurn, assistantTurn]);
-    if (history.length === 0) {
-      await this._autoNameChat(chatId, originalPrompt);
-      this._send('chatNamed', { id: chatId, name: this._nameChatFromMessage(originalPrompt) });
-    }
-    this._isAgentRunning = false;
-    this._send('chatDone', { success: result.success, summary, files: result.files });
-
-    if (result.success && cwd) {
-      await autoReview(
-        enriched, summary, filesWritten, cwd,
-        serverUrl || undefined, token || undefined,
-        this._send.bind(this),
-      );
-    }
-
-    if (result.files.length > 0) {
-      vscode.commands.executeCommand('workbench.view.explorer');
-      vscode.window.setStatusBarMessage(`OgaCode: ${result.files.length} file(s) written`, 4000);
-
-      const touchedWeb = result.files.some(f => /\.(html|css|js|ts|jsx|tsx)$/.test(f));
-      if (touchedWeb && this._lastPreviewFile) {
-        setTimeout(() => PreviewPanel.show(this._getCwd(), this._lastPreviewFile!), 800);
-      }
-
-      const folder = this._getCwd();
-      const hasPackageJson = result.files.some(f => f.endsWith('package.json'));
-      const hasAppJson = result.files.some(f => f.endsWith('app.json') || f.endsWith('app.config.js'))
-        || (folder ? (await vscode.workspace.findFiles('app.json', '**/node_modules/**', 1)).length > 0 : false);
-      if (hasAppJson) { this._send('showExpobtn', {}); }
-
-      if (!hasPackageJson && folder) {
-        const path = require('path') as typeof import('path');
-        const fs = require('fs') as typeof import('fs');
-        let htmlFile = result.files.find(f => f.endsWith('index.html') || f.endsWith('.html'));
-        if (htmlFile) {
-          const abs = path.isAbsolute(htmlFile) ? htmlFile : path.join(folder, htmlFile);
-          if (!fs.existsSync(abs)) { htmlFile = undefined; }
-        }
-        if (!htmlFile) {
-          const uris = await vscode.workspace.findFiles('**/index.html', '**/node_modules/**', 5);
-          if (uris.length) { htmlFile = path.relative(folder, uris[0].fsPath); }
-        }
-        if (htmlFile) {
-          this._lastPreviewFile = htmlFile;
-          PreviewPanel.show(folder, htmlFile);
-          this._send('staticReady', { file: htmlFile });
-        } else if (this._lastPreviewFile) {
-          PreviewPanel.show(folder, this._lastPreviewFile);
-        }
-      }
     }
   }
 }
