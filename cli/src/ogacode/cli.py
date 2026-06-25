@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -244,10 +245,8 @@ def setup() -> None:
     console.print("[bold]OgaCode Setup[/]\n")
     # (key_name, label, hint, hide_input, min_len)
     fields = [
-        ("server_url",       "OgaCode server URL",   "https://ogacode-production.up.railway.app", False, 0),
-        ("token",            "OgaCode access token", "your token from OgaCode",                   True,  0),
-        ("deepseek_api_key", "DeepSeek API key",     "platform.deepseek.com -> API Keys",         True,  20),
-        ("groq_api_key",     "Groq API key",         "console.groq.com -> API Keys (free)",       True,  20),
+        ("server_url", "OgaCode server URL",   "https://ogacode-production.up.railway.app", False, 0),
+        ("token",      "OgaCode access token", "your token from OgaCode",                   True,  0),
     ]
     for key_name, label, hint, hide, min_len in fields:
         existing = get_api_key(key_name)
