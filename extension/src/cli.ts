@@ -171,6 +171,7 @@ export function planThenRun(
   token: string,
   onEvent: (evt: AgentEvent) => void,
   signal?: AbortSignal,
+  filesJsonPath?: string,
 ): PlanThenRunHandle {
   const env: NodeJS.ProcessEnv = { ...process.env };
   env['OGACODE_SERVER_URL'] = serverUrl;
@@ -179,8 +180,11 @@ export function planThenRun(
   const taskFile = path.join(tmpdir(), `ogacode-merge-${Date.now()}.txt`);
   writeFileSync(taskFile, task, 'utf8');
 
+  const spawnArgs = ['--merge', '--task-file', taskFile];
+  if (filesJsonPath) { spawnArgs.push('--files-json', filesJsonPath); }
+
   const proc = spawn(
-    'python', ['-m', 'ogacode.cli', '--merge', '--task-file', taskFile],
+    'python', ['-m', 'ogacode.cli', ...spawnArgs],
     { cwd, env, windowsHide: true },
   );
 
@@ -272,6 +276,15 @@ export function planThenRun(
         steps: ['Plan generation failed.'],
         components: [], stepDetails: [], isDefault: true,
       });
+    } else if (executeReject) {
+      // Process exited after plan was shown but before/during execution.
+      // Without this, approve()'s Promise hangs forever.
+      const detail = stderrLog.trim().slice(0, 200);
+      executeReject(new Error(
+        detail
+          ? `Agent process exited unexpectedly (code ${code ?? '?'}): ${detail}`
+          : `Agent process exited unexpectedly (code ${code ?? '?'}). Try again.`
+      ));
     }
   });
 
@@ -290,7 +303,12 @@ export function planThenRun(
       executeReject = reject;
       const approval: Record<string, unknown> = { action: 'approve' };
       if (steps && steps.length > 0) { approval.steps = steps; }
-      proc.stdin.write(JSON.stringify(approval) + '\n');
+      try {
+        proc.stdin.write(JSON.stringify(approval) + '\n');
+      } catch {
+        reject(new Error('Agent process exited before approval could be sent. Try again.'));
+        return;
+      }
 
       // Heartbeat: emit "Still working…" if no stdout for 90s (prevents UI looking frozen)
       lastEventTime = Date.now();

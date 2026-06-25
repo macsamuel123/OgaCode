@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { exec } from 'child_process';
 import { AgentEvent, checkKeychainSetup, readKeychain, planThenRun, PlanThenRunHandle, PlanComponent, PlanStepDetail } from '../cli';
+import { FileManager } from '../services/FileManager';
 import { PreviewPanel, ElementSelection } from '../preview/PreviewPanel';
 import { Turn, Chat } from './types';
 import { getSidebarHtml } from './getSidebarHtml';
@@ -20,6 +21,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _selectedElement: ElementSelection | undefined;
   private _previewSelectionDisposable: vscode.Disposable | undefined;
   private _isAgentRunning = false;
+  private _fileManager = new FileManager();
 
   // Execution tracking (reset on each new task)
   private _filesThisRun: string[] = [];
@@ -34,6 +36,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     cwd: string;
     serverUrl: string;
     token: string;
+    filesJsonPath?: string;
   } | undefined;
   private _mergeHandle: PlanThenRunHandle | undefined;
 
@@ -90,7 +93,55 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     steps?: string[];
     clarification?: string;
     filePath?: string;
+    name?: string;
+    content?: string;
+    mimeHint?: string;
+    id?: string;
   }): Promise<void> {
+
+    // ── File upload ───────────────────────────────────────────────────────────
+    if (message.command === 'fileUpload' && message.name && message.content) {
+      try {
+        const f = this._fileManager.add(message.name, message.content);
+        this._send('fileAdded', { id: f.id, name: f.name, size: f.size });
+      } catch (err) {
+        this._send('fileError', { msg: err instanceof Error ? err.message : 'Could not add file.' });
+      }
+      return;
+    }
+
+    if (message.command === 'removeFile' && message.id) {
+      this._fileManager.remove(message.id);
+      this._send('fileRemoved', { id: message.id });
+      return;
+    }
+
+    if (message.command === 'fileUploadPick') {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFiles: true, canSelectFolders: false, canSelectMany: true,
+        openLabel: 'Attach', title: 'Attach context files',
+        filters: {
+          'Text Files': ['txt','md','csv','json','yaml','yml','html','css',
+            'js','ts','py','java','go','rs','c','cpp','h','rb','php','sh','sql','xml','toml'],
+        },
+      });
+      for (const uri of picked ?? []) {
+        try {
+          const raw = await vscode.workspace.fs.readFile(uri);
+          const content = Buffer.from(raw).toString('utf8');
+          const name = uri.path.split('/').pop() ?? 'file';
+          if (content.length > 50_000) {
+            this._send('fileError', { msg: `${name} exceeds the 50 KB limit.` });
+            continue;
+          }
+          const f = this._fileManager.add(name, content);
+          this._send('fileAdded', { id: f.id, name: f.name, size: f.size });
+        } catch {
+          this._send('fileError', { msg: 'Could not read file.' });
+        }
+      }
+      return;
+    }
 
     // ── Run agent task ────────────────────────────────────────────────────────
     if (message.command === 'chat' && message.prompt) {
@@ -154,6 +205,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
         if (this._mergeHandle) { this._mergeHandle.abort(); }
 
+        const filesJsonPath = this._fileManager.hasFiles()
+          ? this._fileManager.writeJsonFile()
+          : undefined;
+
         const handle = planThenRun(
           userPrompt,
           cwd,
@@ -175,6 +230,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             this._send('agentEvent', evt);
           },
           this._abortController?.signal,
+          filesJsonPath,
         );
         this._mergeHandle = handle;
 
@@ -199,6 +255,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           cwd,
           serverUrl,
           token,
+          filesJsonPath,
         };
         this._isAgentRunning = false;
         this._send('showPlan', {
@@ -249,14 +306,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           this._send('chatNamed', { id: p.chatId, name: this._nameChatFromMessage(p.userTurn.content) });
         }
 
+        if (p.filesJsonPath) { FileManager.cleanup(p.filesJsonPath); }
+        this._fileManager.clear();
+        this._send('fileClearAll', {});
+
         this._isAgentRunning = false;
-        this._send('chatDone', {
-          success: result.success,
-          summary,
-          files: allFiles,
-          steps: this._stepCount,
-          elapsed,
-        });
+        const isStepLimit = !result.success && (result.summary ?? '').includes('step limit');
+        if (isStepLimit) {
+          this._send('chatPaused', { stepsDone: this._stepCount, stepsTotal: 200 });
+        } else if (result.success) {
+          this._send('chatDone', { success: true, summary, files: allFiles, steps: this._stepCount, elapsed });
+        } else {
+          this._send('chatError', { msg: result.summary || 'Task failed.' });
+        }
 
         if (result.success && p.cwd) {
           await autoReview(
@@ -298,6 +360,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           }
         }
       } catch (err) {
+        if (p.filesJsonPath) { FileManager.cleanup(p.filesJsonPath); }
+        this._fileManager.clear();
+        this._send('fileClearAll', {});
         this._isAgentRunning = false;
         this._mergeHandle = undefined;
         this._pendingPlan = undefined;
@@ -307,6 +372,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
 
     if (message.command === 'planReject') {
+      if (this._pendingPlan?.filesJsonPath) { FileManager.cleanup(this._pendingPlan.filesJsonPath); }
+      this._fileManager.clear();
+      this._send('fileClearAll', {});
       if (this._mergeHandle) {
         this._mergeHandle.reject();
         this._mergeHandle = undefined;
@@ -334,6 +402,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           p.token,
           (evt) => this._send('agentEvent', evt),
           this._abortController?.signal,
+          p.filesJsonPath,
         );
         this._mergeHandle = handle;
 
@@ -547,6 +616,46 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     if (message.command === 'clearElement') {
       this._selectedElement = undefined;
+      return;
+    }
+
+    // ── Chat history ──────────────────────────────────────────────────────────
+    if (message.command === 'requestChatHistory') {
+      const activeId = this._ctx.globalState.get<string>(ACTIVE_CHAT_KEY) ?? '';
+      const chats = this._getAllChats().map(c => {
+        const lastTurn = c.turns[c.turns.length - 1];
+        return {
+          id: c.id,
+          name: c.name || 'Untitled',
+          snippet: lastTurn ? lastTurn.content.slice(0, 80) : '',
+          createdAt: c.createdAt,
+          updatedAt: c.updatedAt,
+        };
+      });
+      this._send('chatHistory', { chats, activeId });
+      return;
+    }
+
+    if (message.command === 'newChat') {
+      if (this._mergeHandle) { this._mergeHandle.abort(); this._mergeHandle = undefined; }
+      this._isAgentRunning = false;
+      this._pendingPlan = undefined;
+      await this._createNewChat();
+      this._send('resetToIdle', {});
+      return;
+    }
+
+    if (message.command === 'switchChat') {
+      const targetId = ((message as unknown) as { id: string }).id;
+      if (targetId) {
+        await this._ctx.globalState.update(ACTIVE_CHAT_KEY, targetId);
+        const chat = this._getAllChats().find(c => c.id === targetId);
+        if (chat && chat.turns.length > 0) {
+          this._send('restoreChat', { turns: chat.turns, name: chat.name });
+        } else {
+          this._send('resetToIdle', {});
+        }
+      }
       return;
     }
   }
