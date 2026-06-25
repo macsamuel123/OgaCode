@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ogacode.agent.events import (
-    CORRECTION, ESCALATE, POST_TOOL, PRE_TOOL, PROVIDER, STOP, SUPERVISOR, THINKING,
+    CORRECTION, ESCALATE, NARRATIVE, POST_TOOL, PRE_TOOL, PROVIDER, STOP, SUPERVISOR, THINKING,
     EventBus,
 )
 from ogacode.agent.supervisor import review as supervisor_review
@@ -18,6 +18,7 @@ from ogacode.tools.ripgrep_search import RipgrepSearchTool
 from ogacode.tools.test_runner import TestRunnerTool
 from ogacode.tools.git_ops import GitOpsTool
 from ogacode.tools.web_search import WebSearchTool
+from ogacode.tracer import Tracer
 
 _OS = platform.system()
 _SHELL_NOTE = (
@@ -259,6 +260,7 @@ async def agent_loop(
     offline: bool = False,
     use_supervisor: bool = True,
     max_iterations: int = 200,
+    plan_steps: list[str] | None = None,
 ) -> AgentResult:
     """
     Plan -> Act -> Observe -> Correct loop.
@@ -268,6 +270,11 @@ async def agent_loop(
     """
     if bus is None:
         bus = EventBus()
+
+    tracer = Tracer(task, cwd)
+    if plan_steps:
+        tracer.set_plan(plan_steps)
+    tracer.attach(bus)
 
     if offline:
         from ogacode.queue import enqueue
@@ -336,6 +343,10 @@ async def agent_loop(
         if not msg.get("tool_calls"):
             content = (msg.get("content") or "").strip()
 
+            # Emit narrative text so the sidebar can render agent reasoning bubbles
+            if content and not content.upper().startswith(("DONE:", "HELP:")):
+                bus.emit(NARRATIVE, text=content)
+
             if content.upper().startswith("DONE:"):
                 summary = content[5:].strip().split("\n\n")[0].strip()
                 if use_supervisor and files_written:
@@ -376,21 +387,59 @@ async def agent_loop(
             tool = tool_map.get(fn_name)
             if not tool:
                 result_tr: ToolResult = ToolResult(success=False, output="", error=f"Unknown tool: {fn_name}")
+                _diff_data = None
             else:
                 # Suppress large string args from the event log
                 skip = {"content", "old_string", "new_string"}
                 log_args = {k: v for k, v in kwargs.items() if k not in skip}
                 if "old_string" in kwargs:
                     log_args["edit"] = f"{len(kwargs['old_string'])}→{len(kwargs.get('new_string',''))} chars"
+
+                # Capture file content before editing so we can produce a diff
+                _before = ""
+                if fn_name == "file_edit" and kwargs.get("path"):
+                    try:
+                        _before = Path(kwargs["path"]).read_text(errors="replace")
+                    except OSError:
+                        _before = ""
+
                 bus.emit(PRE_TOOL, tool=fn_name, args=log_args)
-                result_tr = tool.execute(**kwargs)
+                try:
+                    result_tr = tool.execute(**kwargs)
+                except TypeError as exc:
+                    result_tr = ToolResult(success=False, output="",
+                                           error=f"Bad tool call — missing required argument: {exc}")
+                except Exception as exc:
+                    result_tr = ToolResult(success=False, output="", error=f"Tool error: {exc}")
                 if fn_name == "file_edit" and result_tr.success and kwargs.get("action") in ("create", "edit"):
                     p = kwargs.get("path", "")
                     if p and p not in files_written:
                         files_written.append(p)
 
+                # Compute unified diff for the sidebar file strip
+                _diff_data = None
+                if fn_name == "file_edit" and result_tr.success and kwargs.get("path"):
+                    import difflib as _dl
+                    try:
+                        _after = Path(kwargs["path"]).read_text(errors="replace")
+                        _patch = list(_dl.unified_diff(
+                            _before.splitlines(keepends=True),
+                            _after.splitlines(keepends=True),
+                            n=3,
+                        ))
+                        _added   = sum(1 for l in _patch if l.startswith("+") and not l.startswith("+++"))
+                        _removed = sum(1 for l in _patch if l.startswith("-") and not l.startswith("---"))
+                        _diff_data = {
+                            "stat": f"+{_added} -{_removed}",
+                            "is_new": not bool(_before),
+                            "patch": "".join(_patch)[:8000],
+                        }
+                    except OSError:
+                        pass
+
             bus.emit(POST_TOOL, tool=fn_name, success=result_tr.success,
-                     output=result_tr.output[:500], error=result_tr.error)
+                     output=result_tr.output[:500], error=result_tr.error,
+                     diff=_diff_data)
 
             if result_tr.success:
                 consecutive_failures = 0

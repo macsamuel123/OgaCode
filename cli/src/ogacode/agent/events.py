@@ -10,6 +10,7 @@ SUPERVISOR = "supervisor"    # supervisor reviewing work
 ESCALATE  = "escalate"    # agent needs human input
 STOP      = "stop"        # agent finished (success or failure)
 PROVIDER  = "provider"    # switched to a provider
+NARRATIVE = "narrative"   # agent text without a tool call (reasoning / explanation)
 
 
 class EventBus:
