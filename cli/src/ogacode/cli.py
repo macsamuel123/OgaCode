@@ -22,6 +22,17 @@ console = Console()
 _SUBCOMMANDS = frozenset({"setup", "doctor", "stats", "rollback", "config", "flush", "memory", "rag"})
 
 
+def _is_configured() -> bool:
+    """Return True if server URL is set via env var or keychain."""
+    if os.environ.get("OGACODE_SERVER_URL", ""):
+        return True
+    try:
+        import keyring as _kr
+        return bool(_kr.get_password("ogacode", "server_url"))
+    except Exception:
+        return False
+
+
 def main() -> None:
     args = sys.argv[1:]
 
@@ -33,6 +44,18 @@ def main() -> None:
         console.print(f"ogacode {__version__}")
         return
 
+    # Skip first-run check for meta-commands that don't need a server
+    _meta = {"setup", "doctor", "config", "stats", "rollback", "flush",
+              "memory", "rag", "queue"}
+    if args[0] not in _meta and not args[0].startswith("-") and not _is_configured():
+        console.print("[bold yellow]⚡ OgaCode — First-time setup[/]\n")
+        console.print("No server configured yet. Let's get you set up first.\n")
+        setup.callback()  # type: ignore[attr-defined]
+        if not _is_configured():
+            console.print("\n[red]Setup incomplete.[/] Run [bold]ogacode setup[/] to try again.")
+            sys.exit(1)
+        console.print()
+
     stream   = "--stream"  in args
     json_out = "--json"    in args
     offline  = "--offline" in args
@@ -43,6 +66,24 @@ def main() -> None:
         idx = args.index('--task-file')
         if idx + 1 < len(args):
             task = Path(args[idx + 1]).read_text(encoding='utf-8').strip()
+
+            # --files-json <path>: inject user-uploaded file content into task context
+            if '--files-json' in args:
+                fidx = args.index('--files-json')
+                if fidx + 1 < len(args):
+                    try:
+                        files_data = json.loads(Path(args[fidx + 1]).read_text(encoding='utf-8'))
+                        if files_data:
+                            parts = ['=== UPLOADED FILES (user-provided context) ===']
+                            for f in files_data:
+                                name    = f.get('name', 'file')
+                                content = f.get('content', '')[:40_000]
+                                parts.append(f'--- {name} ---')
+                                parts.append(content)
+                            parts.append('=== END UPLOADED FILES ===')
+                            task = '\n'.join(parts) + '\n\n' + task
+                    except Exception:
+                        pass  # file parsing must never crash the CLI
 
             # --plan-only: generate plan, emit JSON, exit — no agent execution
             if '--plan-only' in args:
@@ -87,11 +128,6 @@ def main() -> None:
                 if approval.get("action") != "approve":
                     print(json.dumps({"type": "cancelled"}), flush=True)
                     return
-
-                approved_steps = approval.get("steps")
-                if approved_steps:
-                    steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(approved_steps))
-                    task = f"[APPROVED PLAN — follow these steps in order]\n{steps_text}\n[END PLAN]\n\n{task}"
 
                 bus = EventBus()
                 bus.on_any(make_audit_listener())
@@ -206,23 +242,34 @@ def _cli() -> None:
 @_cli.command()
 def setup() -> None:
     console.print("[bold]OgaCode Setup[/]\n")
-    for key_name, label, hint in [
-        ("deepseek_api_key", "DeepSeek API key", "platform.deepseek.com -> API Keys"),
-        ("groq_api_key",     "Groq API key",     "console.groq.com -> API Keys (free tier)"),
-    ]:
+    # (key_name, label, hint, hide_input, min_len)
+    fields = [
+        ("server_url",       "OgaCode server URL",   "https://ogacode-production.up.railway.app", False, 0),
+        ("token",            "OgaCode access token", "your token from OgaCode",                   True,  0),
+        ("deepseek_api_key", "DeepSeek API key",     "platform.deepseek.com -> API Keys",         True,  20),
+        ("groq_api_key",     "Groq API key",         "console.groq.com -> API Keys (free)",       True,  20),
+    ]
+    for key_name, label, hint, hide, min_len in fields:
         existing = get_api_key(key_name)
         if existing:
             if not click.confirm(f"  {label} already set. Overwrite?", default=False):
                 continue
-        key = click.prompt(f"  {label} ({hint})", hide_input=True)
+        # server_url: use Railway URL as the real default so Enter accepts it
+        if key_name == "server_url":
+            default_val = existing or hint
+            key = click.prompt(f"  {label}", default=default_val, hide_input=hide, show_default=True)
+        else:
+            key = click.prompt(f"  {label} ({hint})", hide_input=hide, default="", show_default=False)
         key = key.strip()
         if not key:
+            console.print(f"  [dim]Skipped.[/]\n")
             continue
-        if len(key) < 20:
-            console.print(f"  [red]Error:[/] {label} must be at least 20 characters (got {len(key)})\n")
+        if min_len and len(key) < min_len:
+            console.print(f"  [red]Error:[/] {label} must be at least {min_len} characters (got {len(key)})\n")
             continue
         set_api_key(key_name, key)
         console.print(f"  [green]OK[/] {label} saved\n")
+    console.print("[bold green]✓ Setup complete![/] Verify with [bold]ogacode doctor[/], then try:\n  [cyan]ogacode \"build me a hello world in Python\"[/]\n")
 
 
 @_cli.command()
@@ -252,7 +299,8 @@ def doctor() -> None:
             console.print(f"  [red]FAIL[/] {name}: unreachable")
 
     # OgaCode managed server health
-    server_url = os.environ.get("OGACODE_SERVER_URL", "").rstrip("/")
+    server_url = (os.environ.get("OGACODE_SERVER_URL", "") or
+                  _kr.get_password("ogacode", "server_url") or "").rstrip("/")
     if server_url:
         try:
             r = httpx.get(f"{server_url}/health", timeout=6)

@@ -1,386 +1,611 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nigerian Expense Tracker</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #121212;
-    color: #e0e0e0;
-    min-height: 100vh;
-    display: flex;
-    justify-content: center;
-    padding: 20px;
-  }
-  .container { max-width: 700px; width: 100%; }
-  h1 {
-    text-align: center;
-    color: #00c853;
-    margin: 20px 0;
-    font-size: 2rem;
-  }
-  h1 span { color: #ffd600; }
-  h2 {
-    color: #bbbbbb;
-    margin: 20px 0 10px;
-    font-size: 1.3rem;
-    border-bottom: 1px solid #333;
-    padding-bottom: 6px;
-  }
-  .card {
-    background: #1e1e1e;
-    border-radius: 10px;
-    padding: 20px;
-    margin-bottom: 20px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
-  }
-  .form-row {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    align-items: center;
-  }
-  .form-row input, .form-row select {
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #e0e0e0;
-    padding: 10px 12px;
-    border-radius: 6px;
-    font-size: 0.95rem;
-    flex: 1;
-    min-width: 120px;
-  }
-  .form-row input:focus, .form-row select:focus {
-    outline: none;
-    border-color: #00c853;
-  }
-  .form-row button {
-    background: #00c853;
-    color: #000;
-    border: none;
-    padding: 10px 20px;
-    border-radius: 6px;
-    font-size: 0.95rem;
-    font-weight: 600;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .form-row button:hover { background: #00e676; }
-  .amount-prefix {
-    display: flex;
-    align-items: center;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    border-radius: 6px;
-    overflow: hidden;
-    flex: 1;
-    min-width: 120px;
-  }
-  .amount-prefix span {
-    background: #333;
-    padding: 10px 10px;
-    color: #ffd600;
-    font-weight: 600;
-    font-size: 0.95rem;
-  }
-  .amount-prefix input {
-    border: none;
-    background: transparent;
-    color: #e0e0e0;
-    padding: 10px 12px;
-    font-size: 0.95rem;
-    flex: 1;
-    min-width: 60px;
-  }
-  .amount-prefix input:focus { outline: none; }
-  .expense-item {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 0;
-    border-bottom: 1px solid #2a2a2a;
-  }
-  .expense-item:last-child { border-bottom: none; }
-  .expense-info { flex: 1; }
-  .expense-desc {
-    font-weight: 500;
-    margin-bottom: 2px;
-  }
-  .expense-meta {
-    font-size: 0.8rem;
-    color: #888;
-  }
-  .expense-amount {
-    font-weight: 600;
-    color: #ffd600;
-    margin-right: 15px;
-    white-space: nowrap;
-  }
-  .expense-actions button {
-    background: #d32f2f;
-    color: #fff;
-    border: none;
-    padding: 6px 12px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 0.8rem;
-  }
-  .expense-actions button:hover { background: #f44336; }
-  .empty-msg {
-    text-align: center;
-    color: #666;
-    padding: 20px;
-    font-style: italic;
-  }
-  .summary-grid {
-    display: grid;
-    gap: 12px;
-  }
-  .summary-item {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .summary-header {
-    display: flex;
-    justify-content: space-between;
-    font-size: 0.9rem;
-  }
-  .summary-cat { color: #aaa; }
-  .summary-val { color: #ffd600; font-weight: 600; }
-  .progress-bar {
-    height: 12px;
-    background: #2a2a2a;
-    border-radius: 6px;
-    overflow: hidden;
-  }
-  .progress-fill {
-    height: 100%;
-    border-radius: 6px;
-    transition: width 0.4s ease;
-  }
-  .total-row {
-    display: flex;
-    justify-content: space-between;
-    margin-top: 12px;
-    padding-top: 12px;
-    border-top: 1px solid #333;
-    font-size: 1.1rem;
-    font-weight: 600;
-  }
-  .total-row .total-label { color: #bbb; }
-  .total-row .total-val { color: #00c853; }
-  .toast {
-    position: fixed;
-    bottom: 20px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: #333;
-    color: #fff;
-    padding: 12px 24px;
-    border-radius: 8px;
-    font-size: 0.9rem;
-    opacity: 0;
-    transition: opacity 0.3s;
-    pointer-events: none;
-    z-index: 999;
-  }
-  .toast.show { opacity: 1; }
-  .loading { text-align: center; color: #666; padding: 10px; }
-</style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NairaFlow — Send Money Instantly</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    /* ===== RESET & BASE ===== */
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: #0a0a0f;
+      color: #e4e4e7;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+    h1, h2, h3, h4, h5, h6 { font-family: 'Outfit', sans-serif; font-weight: 700; }
+    a { text-decoration: none; color: inherit; }
+    img { max-width: 100%; display: block; }
+
+    /* ===== UTILITY ===== */
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+    .section-title {
+      font-size: clamp(2rem, 5vw, 3rem);
+      text-align: center;
+      margin-bottom: 16px;
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .section-sub {
+      text-align: center;
+      color: #a1a1aa;
+      font-size: 1.1rem;
+      max-width: 600px;
+      margin: 0 auto 56px;
+    }
+
+    /* ===== NAVBAR ===== */
+    .navbar {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 1000;
+      padding: 16px 0;
+      background: rgba(10, 10, 15, 0.85);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      transition: all 0.3s ease;
+    }
+    .navbar .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .logo {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.6rem;
+      font-weight: 800;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .logo-icon {
+      width: 36px; height: 36px;
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.2rem;
+      color: #0a0a0f;
+    }
+    .logo span { background: linear-gradient(135deg, #f59e0b, #f97316); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .nav-links { display: flex; gap: 32px; list-style: none; }
+    .nav-links a {
+      font-size: 0.95rem;
+      font-weight: 500;
+      color: #a1a1aa;
+      transition: color 0.3s ease;
+      position: relative;
+    }
+    .nav-links a::after {
+      content: '';
+      position: absolute;
+      bottom: -4px; left: 0;
+      width: 0; height: 2px;
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      transition: width 0.3s ease;
+    }
+    .nav-links a:hover { color: #f59e0b; }
+    .nav-links a:hover::after { width: 100%; }
+    .nav-cta {
+      padding: 10px 24px;
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      border: none;
+      border-radius: 8px;
+      color: #0a0a0f;
+      font-family: 'Outfit', sans-serif;
+      font-weight: 600;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: transform 0.3s ease, box-shadow 0.3s ease;
+    }
+    .nav-cta:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(245,158,11,0.35); }
+    .hamburger { display: none; flex-direction: column; gap: 5px; cursor: pointer; background: none; border: none; }
+    .hamburger span { width: 26px; height: 2.5px; background: #e4e4e7; border-radius: 2px; transition: all 0.3s ease; }
+
+    /* ===== HERO ===== */
+    .hero {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 120px 24px 80px;
+      position: relative;
+      overflow: hidden;
+    }
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: -50%; left: -50%;
+      width: 200%; height: 200%;
+      background: radial-gradient(ellipse at 30% 50%, rgba(245,158,11,0.08) 0%, transparent 60%),
+                  radial-gradient(ellipse at 70% 50%, rgba(249,115,22,0.06) 0%, transparent 60%);
+      pointer-events: none;
+    }
+    .hero-content { position: relative; z-index: 1; max-width: 800px; }
+    .hero-badge {
+      display: inline-block;
+      padding: 8px 20px;
+      border-radius: 100px;
+      background: rgba(245,158,11,0.12);
+      border: 1px solid rgba(245,158,11,0.25);
+      color: #f59e0b;
+      font-size: 0.85rem;
+      font-weight: 500;
+      margin-bottom: 24px;
+      letter-spacing: 0.5px;
+    }
+    .hero h1 {
+      font-size: clamp(2.8rem, 8vw, 5rem);
+      font-weight: 800;
+      line-height: 1.1;
+      margin-bottom: 20px;
+      letter-spacing: -1px;
+    }
+    .hero h1 .highlight {
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero p {
+      font-size: clamp(1rem, 2vw, 1.25rem);
+      color: #a1a1aa;
+      max-width: 600px;
+      margin: 0 auto 36px;
+      line-height: 1.7;
+    }
+    .hero-buttons { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+    .btn-primary {
+      padding: 16px 40px;
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      border: none;
+      border-radius: 12px;
+      color: #0a0a0f;
+      font-family: 'Outfit', sans-serif;
+      font-weight: 700;
+      font-size: 1.05rem;
+      cursor: pointer;
+      transition: transform 0.3s ease, box-shadow 0.3s ease;
+    }
+    .btn-primary:hover { transform: translateY(-3px); box-shadow: 0 12px 32px rgba(245,158,11,0.35); }
+    .btn-secondary {
+      padding: 16px 40px;
+      background: transparent;
+      border: 1.5px solid rgba(255,255,255,0.15);
+      border-radius: 12px;
+      color: #e4e4e7;
+      font-family: 'Outfit', sans-serif;
+      font-weight: 600;
+      font-size: 1.05rem;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    .btn-secondary:hover { border-color: #f59e0b; color: #f59e0b; transform: translateY(-3px); }
+    .hero-stats {
+      display: flex;
+      justify-content: center;
+      gap: 48px;
+      margin-top: 56px;
+      flex-wrap: wrap;
+    }
+    .hero-stat { text-align: center; }
+    .hero-stat h3 {
+      font-size: 2rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero-stat p { font-size: 0.9rem; color: #71717a; margin-top: 4px; }
+
+    /* ===== FEATURES ===== */
+    .features {
+      padding: 100px 0;
+      background: #0e0e16;
+    }
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 28px;
+    }
+    .feature-card {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 20px;
+      padding: 40px 32px;
+      text-align: center;
+      transition: all 0.4s ease;
+      position: relative;
+      overflow: hidden;
+    }
+    .feature-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0;
+      right: 0; height: 3px;
+      background: linear-gradient(90deg, #f59e0b, #f97316);
+      transform: scaleX(0);
+      transform-origin: left;
+      transition: transform 0.4s ease;
+    }
+    .feature-card:hover { transform: translateY(-8px); border-color: rgba(245,158,11,0.2); box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+    .feature-card:hover::before { transform: scaleX(1); }
+    .feature-icon {
+      width: 64px; height: 64px;
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 20px;
+      font-size: 1.8rem;
+      transition: transform 0.4s ease;
+    }
+    .feature-card:hover .feature-icon { transform: scale(1.1) rotate(-5deg); }
+    .feature-icon.fast { background: rgba(245,158,11,0.12); color: #f59e0b; }
+    .feature-icon.secure { background: rgba(34,197,94,0.12); color: #22c55e; }
+    .feature-icon.easy { background: rgba(59,130,246,0.12); color: #3b82f6; }
+    .feature-card h3 { font-size: 1.4rem; margin-bottom: 12px; }
+    .feature-card p { color: #a1a1aa; font-size: 0.95rem; line-height: 1.7; }
+
+    /* ===== PRICING ===== */
+    .pricing {
+      padding: 100px 0;
+      background: #0a0a0f;
+    }
+    .pricing-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 28px;
+      align-items: start;
+    }
+    .pricing-card {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 20px;
+      padding: 40px 32px;
+      text-align: center;
+      transition: all 0.4s ease;
+      position: relative;
+    }
+    .pricing-card:hover { transform: translateY(-8px); border-color: rgba(245,158,11,0.2); box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+    .pricing-card.popular {
+      border-color: rgba(245,158,11,0.3);
+      background: rgba(245,158,11,0.04);
+      transform: scale(1.03);
+    }
+    .pricing-card.popular:hover { transform: scale(1.03) translateY(-8px); }
+    .popular-badge {
+      position: absolute;
+      top: -12px; left: 50%;
+      transform: translateX(-50%);
+      padding: 6px 20px;
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      border-radius: 100px;
+      color: #0a0a0f;
+      font-size: 0.8rem;
+      font-weight: 700;
+      font-family: 'Outfit', sans-serif;
+      letter-spacing: 0.5px;
+    }
+    .pricing-card .plan-name { font-size: 1.1rem; color: #a1a1aa; margin-bottom: 16px; }
+    .pricing-card .price {
+      font-size: 3rem;
+      font-weight: 800;
+      font-family: 'Outfit', sans-serif;
+      margin-bottom: 4px;
+    }
+    .pricing-card .price span { font-size: 1.2rem; font-weight: 400; color: #71717a; }
+    .pricing-card .price-desc { color: #71717a; font-size: 0.9rem; margin-bottom: 28px; }
+    .pricing-card ul { list-style: none; text-align: left; margin-bottom: 32px; }
+    .pricing-card ul li {
+      padding: 10px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.95rem;
+      color: #d4d4d8;
+    }
+    .pricing-card ul li::before {
+      content: '✓';
+      color: #22c55e;
+      font-weight: 700;
+      font-size: 1rem;
+    }
+    .pricing-card ul li:last-child { border-bottom: none; }
+    .pricing-card .btn-pricing {
+      width: 100%;
+      padding: 14px;
+      border-radius: 10px;
+      border: 1.5px solid rgba(255,255,255,0.1);
+      background: transparent;
+      color: #e4e4e7;
+      font-family: 'Outfit', sans-serif;
+      font-weight: 600;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    .pricing-card .btn-pricing:hover { border-color: #f59e0b; color: #f59e0b; }
+    .pricing-card.popular .btn-pricing {
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      border: none;
+      color: #0a0a0f;
+    }
+    .pricing-card.popular .btn-pricing:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(245,158,11,0.35); }
+
+    /* ===== CTA ===== */
+    .cta {
+      padding: 100px 0;
+      background: #0e0e16;
+      text-align: center;
+    }
+    .cta-box {
+      max-width: 700px;
+      margin: 0 auto;
+      padding: 64px 48px;
+      border-radius: 24px;
+      background: linear-gradient(135deg, rgba(245,158,11,0.06), rgba(249,115,22,0.04));
+      border: 1px solid rgba(245,158,11,0.12);
+      position: relative;
+      overflow: hidden;
+    }
+    .cta-box::before {
+      content: '';
+      position: absolute;
+      top: -50%; left: -50%;
+      width: 200%; height: 200%;
+      background: radial-gradient(ellipse at center, rgba(245,158,11,0.06) 0%, transparent 60%);
+      pointer-events: none;
+    }
+    .cta-box h2 {
+      font-size: clamp(1.8rem, 4vw, 2.5rem);
+      margin-bottom: 16px;
+      position: relative;
+    }
+    .cta-box p {
+      color: #a1a1aa;
+      font-size: 1.05rem;
+      margin-bottom: 32px;
+      position: relative;
+    }
+    .cta-box .btn-primary { font-size: 1.1rem; padding: 18px 48px; }
+
+    /* ===== FOOTER ===== */
+    .footer {
+      padding: 40px 0;
+      border-top: 1px solid rgba(255,255,255,0.05);
+      text-align: center;
+    }
+    .footer p { color: #71717a; font-size: 0.9rem; }
+    .footer-links { display: flex; justify-content: center; gap: 24px; margin-bottom: 16px; flex-wrap: wrap; }
+    .footer-links a { color: #a1a1aa; font-size: 0.9rem; transition: color 0.3s ease; }
+    .footer-links a:hover { color: #f59e0b; }
+
+    /* ===== ANIMATIONS ===== */
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(30px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .hero-content { animation: fadeInUp 0.8s ease forwards; }
+    .feature-card:nth-child(1) { animation: fadeInUp 0.6s ease 0.1s both; }
+    .feature-card:nth-child(2) { animation: fadeInUp 0.6s ease 0.2s both; }
+    .feature-card:nth-child(3) { animation: fadeInUp 0.6s ease 0.3s both; }
+
+    /* ===== RESPONSIVE ===== */
+    @media (max-width: 1024px) {
+      .features-grid, .pricing-grid { grid-template-columns: repeat(2, 1fr); }
+      .pricing-card.popular { transform: scale(1); }
+      .pricing-card.popular:hover { transform: translateY(-8px); }
+    }
+
+    @media (max-width: 768px) {
+      .nav-links { display: none; }
+      .nav-links.open {
+        display: flex;
+        flex-direction: column;
+        position: absolute;
+        top: 100%; left: 0; right: 0;
+        background: rgba(10,10,15,0.98);
+        backdrop-filter: blur(16px);
+        padding: 24px;
+        gap: 20px;
+        border-bottom: 1px solid rgba(255,255,255,0.05);
+      }
+      .hamburger { display: flex; }
+      .hero { padding: 100px 24px 60px; }
+      .hero-stats { gap: 28px; }
+      .features-grid, .pricing-grid { grid-template-columns: 1fr; }
+      .features { padding: 60px 0; }
+      .pricing { padding: 60px 0; }
+      .cta { padding: 60px 0; }
+      .cta-box { padding: 40px 24px; }
+      .hero-buttons { flex-direction: column; align-items: center; }
+      .btn-primary, .btn-secondary { width: 100%; max-width: 300px; text-align: center; }
+    }
+
+    @media (max-width: 480px) {
+      .hero h1 { font-size: 2.4rem; }
+      .hero-stat h3 { font-size: 1.6rem; }
+      .pricing-card .price { font-size: 2.4rem; }
+    }
+  </style>
 </head>
 <body>
-<div class="container">
-  <h1>🇳🇬 <span>Naira</span>Tracker</h1>
 
-  <div class="card">
-    <h2>Add Expense</h2>
-    <div class="form-row">
-      <input type="text" id="desc" placeholder="Description (e.g. Danfo bus)" />
-      <div class="amount-prefix">
-        <span>₦</span>
-        <input type="number" id="amount" placeholder="Amount" min="1" step="0.01" />
+  <!-- ===== NAVBAR ===== -->
+  <nav class="navbar">
+    <div class="container">
+      <a href="#" class="logo">
+        <div class="logo-icon">N</div>
+        <span>NairaFlow</span>
+      </a>
+      <ul class="nav-links" id="navLinks">
+        <li><a href="#features">Features</a></li>
+        <li><a href="#pricing">Pricing</a></li>
+        <li><a href="#cta">Get Started</a></li>
+      </ul>
+      <button class="nav-cta" onclick="document.getElementById('cta').scrollIntoView({behavior:'smooth'})">Open Account</button>
+      <button class="hamburger" id="hamburger" aria-label="Menu">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- ===== HERO ===== -->
+  <section class="hero">
+    <div class="hero-content">
+      <div class="hero-badge">⚡ Trusted by 50,000+ Nigerians</div>
+      <h1>Send Money <span class="highlight">Instantly</span></h1>
+      <p>Zero-fee transfers, real-time delivery, and bank-grade security. The smartest way to move money across Nigeria and beyond.</p>
+      <div class="hero-buttons">
+        <button class="btn-primary" onclick="document.getElementById('cta').scrollIntoView({behavior:'smooth'})">Get Started Free</button>
+        <button class="btn-secondary">Learn More →</button>
       </div>
-      <select id="category">
-        <option value="Food">Food</option>
-        <option value="Transport">Transport</option>
-        <option value="Data">Data</option>
-        <option value="Electricity">Electricity</option>
-        <option value="Entertainment">Entertainment</option>
-        <option value="Other">Other</option>
-      </select>
-      <button id="addBtn">Add</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Monthly Summary</h2>
-    <div id="summaryContainer">
-      <div class="loading">Loading summary...</div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>All Expenses</h2>
-    <div id="expensesContainer">
-      <div class="loading">Loading expenses...</div>
-    </div>
-  </div>
-</div>
-
-<div id="toast" class="toast"></div>
-
-<script>
-const API = '/api/expenses';
-
-function showToast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2500);
-}
-
-async function apiFetch(method, body) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(API, opts);
-  return res.json();
-}
-
-async function loadExpenses() {
-  const res = await fetch(API);
-  return res.json();
-}
-
-async function deleteExpense(id) {
-  const res = await fetch(`${API}/${id}`, { method: 'DELETE' });
-  return res.json();
-}
-
-function renderExpenses(expenses) {
-  const container = document.getElementById('expensesContainer');
-  if (!expenses || expenses.length === 0) {
-    container.innerHTML = '<div class="empty-msg">No expenses yet. Start tracking!</div>';
-    return;
-  }
-  let html = '';
-  expenses.forEach(e => {
-    html += `
-      <div class="expense-item">
-        <div class="expense-info">
-          <div class="expense-desc">${escapeHtml(e.description)}</div>
-          <div class="expense-meta">${escapeHtml(e.category)}</div>
+      <div class="hero-stats">
+        <div class="hero-stat">
+          <h3>₦2.4B+</h3>
+          <p>Transactions Processed</p>
         </div>
-        <div class="expense-amount">₦${formatAmount(e.amount)}</div>
-        <div class="expense-actions">
-          <button onclick="handleDelete(${e.id})">Delete</button>
+        <div class="hero-stat">
+          <h3>50K+</h3>
+          <p>Active Users</p>
+        </div>
+        <div class="hero-stat">
+          <h3>99.9%</h3>
+          <p>Uptime Guarantee</p>
         </div>
       </div>
-    `;
-  });
-  container.innerHTML = html;
-}
+    </div>
+  </section>
 
-function renderSummary(expenses) {
-  const container = document.getElementById('summaryContainer');
-  if (!expenses || expenses.length === 0) {
-    container.innerHTML = '<div class="empty-msg">No data for this month.</div>';
-    return;
-  }
-
-  const cats = {};
-  const catColors = {
-    Food: '#ff5722',
-    Transport: '#2196f3',
-    Data: '#9c27b0',
-    Electricity: '#ff9800',
-    Entertainment: '#e91e63',
-    Other: '#607d8b'
-  };
-  let total = 0;
-
-  expenses.forEach(e => {
-    cats[e.category] = (cats[e.category] || 0) + e.amount;
-    total += e.amount;
-  });
-
-  let html = '<div class="summary-grid">';
-  const catOrder = ['Food', 'Transport', 'Data', 'Electricity', 'Entertainment', 'Other'];
-  catOrder.forEach(cat => {
-    const val = cats[cat] || 0;
-    const pct = total > 0 ? (val / total * 100) : 0;
-    const color = catColors[cat] || '#607d8b';
-    html += `
-      <div class="summary-item">
-        <div class="summary-header">
-          <span class="summary-cat">${cat}</span>
-          <span class="summary-val">₦${formatAmount(val)}</span>
+  <!-- ===== FEATURES ===== -->
+  <section class="features" id="features">
+    <div class="container">
+      <h2 class="section-title">Why NairaFlow?</h2>
+      <p class="section-sub">Built for speed, hardened for security, designed for everyone.</p>
+      <div class="features-grid">
+        <div class="feature-card">
+          <div class="feature-icon fast">⚡</div>
+          <h3>Fast</h3>
+          <p>Transfers arrive in seconds — not days. Our real-time payment infrastructure ensures your money moves at the speed of light.</p>
         </div>
-        <div class="progress-bar">
-          <div class="progress-fill" style="width:${pct.toFixed(1)}%;background:${color}"></div>
+        <div class="feature-card">
+          <div class="feature-icon secure">🔒</div>
+          <h3>Secure</h3>
+          <p>End-to-end encryption, biometric authentication, and SOC 2 compliance. Your money and data are protected at every step.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon easy">📱</div>
+          <h3>Easy</h3>
+          <p>Set up in under 2 minutes. No paperwork, no branches, no hassle. Just a beautiful app that works when you need it.</p>
         </div>
       </div>
-    `;
-  });
-  html += '</div>';
-  html += `<div class="total-row"><span class="total-label">Total</span><span class="total-val">₦${formatAmount(total)}</span></div>`;
-  container.innerHTML = html;
-}
+    </div>
+  </section>
 
-function formatAmount(n) {
-  return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
+  <!-- ===== PRICING ===== -->
+  <section class="pricing" id="pricing">
+    <div class="container">
+      <h2 class="section-title">Simple Pricing</h2>
+      <p class="section-sub">No hidden fees. No surprises. Pay only for what you need.</p>
+      <div class="pricing-grid">
+        <div class="pricing-card">
+          <div class="plan-name">Basic</div>
+          <div class="price">₦0 <span>/mo</span></div>
+          <div class="price-desc">Perfect for getting started</div>
+          <ul>
+            <li>Up to 50 free transfers / month</li>
+            <li>Instant bank transfers</li>
+            <li>Basic transaction history</li>
+            <li>Email support</li>
+            <li>Single user account</li>
+          </ul>
+          <button class="btn-pricing">Get Started</button>
+        </div>
+        <div class="pricing-card popular">
+          <div class="popular-badge">Most Popular</div>
+          <div class="plan-name">Pro</div>
+          <div class="price">₦2,500 <span>/mo</span></div>
+          <div class="price-desc">For power users &amp; freelancers</div>
+          <ul>
+            <li>Unlimited transfers</li>
+            <li>Instant bank &amp; mobile money</li>
+            <li>Advanced analytics &amp; reports</li>
+            <li>Priority 24/7 support</li>
+            <li>Up to 3 linked accounts</li>
+            <li>API access</li>
+          </ul>
+          <button class="btn-pricing">Start Free Trial</button>
+        </div>
+        <div class="pricing-card">
+          <div class="plan-name">Enterprise</div>
+          <div class="price">₦15,000 <span>/mo</span></div>
+          <div class="price-desc">For businesses &amp; teams</div>
+          <ul>
+            <li>Everything in Pro</li>
+            <li>Bulk transfer processing</li>
+            <li>Dedicated account manager</li>
+            <li>Custom integrations</li>
+            <li>Unlimited team members</li>
+            <li>SLA guarantee</li>
+            <li>White-label options</li>
+          </ul>
+          <button class="btn-pricing">Contact Sales</button>
+        </div>
+      </div>
+    </div>
+  </section>
 
-function escapeHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str;
-  return d.innerHTML;
-}
+  <!-- ===== CTA ===== -->
+  <section class="cta" id="cta">
+    <div class="container">
+      <div class="cta-box">
+        <h2>Ready to <span style="background:linear-gradient(135deg,#f59e0b,#f97316);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">NairaFlow</span>?</h2>
+        <p>Join 50,000+ Nigerians who trust us for instant, secure money transfers. Your first 10 transfers are on us.</p>
+        <button class="btn-primary">Get Started — It's Free</button>
+      </div>
+    </div>
+  </section>
 
-async function refreshAll() {
-  try {
-    const expenses = await loadExpenses();
-    renderExpenses(expenses);
-    renderSummary(expenses);
-  } catch (e) {
-    document.getElementById('expensesContainer').innerHTML = '<div class="empty-msg">Error loading expenses. Is the server running?</div>';
-    document.getElementById('summaryContainer').innerHTML = '<div class="empty-msg">Error loading summary.</div>';
-  }
-}
+  <!-- ===== FOOTER ===== -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-links">
+        <a href="#">Privacy Policy</a>
+        <a href="#">Terms of Service</a>
+        <a href="#">Contact Us</a>
+        <a href="#">FAQ</a>
+      </div>
+      <p>&copy; 2026 NairaFlow. All rights reserved. Licensed by the Central Bank of Nigeria.</p>
+    </div>
+  </footer>
 
-async function handleDelete(id) {
-  try {
-    await deleteExpense(id);
-    showToast('Expense deleted');
-    refreshAll();
-  } catch (e) {
-    showToast('Error deleting expense');
-  }
-}
-
-document.getElementById('addBtn').addEventListener('click', async () => {
-  const desc = document.getElementById('desc').value.trim();
-  const amount = document.getElementById('amount').value.trim();
-  const category = document.getElementById('category').value;
-
-  if (!desc) { showToast('Please enter a description'); return; }
-  if (!amount || parseFloat(amount) <= 0) { showToast('Please enter a valid amount'); return; }
-
-  try {
-    await apiFetch('POST', { description: desc, amount: parseFloat(amount), category });
-    showToast('Expense added!');
-    document.getElementById('desc').value = '';
-    document.getElementById('amount').value = '';
-    refreshAll();
-  } catch (e) {
-    showToast('Error adding expense');
-  }
-});
-
-refreshAll();
-</script>
+  <!-- ===== HAMBURGER TOGGLE ===== -->
+  <script>
+    const hamburger = document.getElementById('hamburger');
+    const navLinks = document.getElementById('navLinks');
+    hamburger.addEventListener('click', () => {
+      navLinks.classList.toggle('open');
+    });
+    document.querySelectorAll('.nav-links a').forEach(link => {
+      link.addEventListener('click', () => navLinks.classList.remove('open'));
+    });
+  </script>
 </body>
 </html>

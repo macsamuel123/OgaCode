@@ -25,9 +25,22 @@ async def call_llm(
     server_url = os.getenv("OGACODE_SERVER_URL", "").rstrip("/")
     token = os.getenv("OGACODE_TOKEN", "")
 
+    # Keychain fallback for direct CLI usage (env vars not set by extension)
+    if not server_url or not token:
+        try:
+            import keyring as _kr
+            if not server_url:
+                server_url = (_kr.get_password("ogacode", "server_url") or "").rstrip("/")
+            if not token:
+                token = _kr.get_password("ogacode", "token") or ""
+        except Exception:
+            pass
+
     if not server_url or not token:
         raise AllProvidersFailedError(
-            "OgaCode token not configured. Add it in VS Code settings (ogacode.token)."
+            "OgaCode not configured.\n"
+            "Run:    ogacode setup\n"
+            "Verify: ogacode doctor"
         )
 
     # Semantic cache: only for simple single-turn completions with no tools
