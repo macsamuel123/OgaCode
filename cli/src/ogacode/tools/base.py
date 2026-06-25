@@ -28,6 +28,7 @@ class ToolResult:
     success: bool
     output: str
     error: str = ""
+    error_type: str = ""  # git_not_initialized | merge_conflict | nothing_to_commit | git_command_failed | ""
 
 
 class Tool:

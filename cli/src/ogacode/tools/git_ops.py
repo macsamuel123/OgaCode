@@ -37,6 +37,11 @@ class GitOpsTool(Tool):
 
     def execute(self, action: str, message: str = "", file: str = "", **_: Any) -> ToolResult:
         try:
+            if action in ("add", "commit", "push"):
+                preflight = self._ensure_repo()
+                if preflight is not None:
+                    return preflight
+
             if action == "status":
                 out = self._run(["git", "status", "--short"])
                 return ToolResult(success=True, output=out or "Nothing to commit, working tree clean")
@@ -87,9 +92,45 @@ class GitOpsTool(Tool):
 
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or "").strip()
-            return ToolResult(success=False, output="", error=f"git error: {stderr or str(exc)}")
+            sl = stderr.lower()
+            if "not a git repository" in sl:
+                error_type = "git_not_initialized"
+                msg = "Not a git repository. git init ran but may have failed — retry git_ops(action='status')."
+            elif "conflict" in sl:
+                error_type = "merge_conflict"
+                msg = f"Merge conflict detected. Resolve conflicts then re-add: {stderr}"
+            elif "nothing to commit" in sl or "nothing added to commit" in sl:
+                error_type = "nothing_to_commit"
+                msg = "Nothing to commit — working tree is clean."
+            else:
+                error_type = "git_command_failed"
+                msg = f"git error: {stderr or str(exc)}"
+            return ToolResult(success=False, output="", error=msg, error_type=error_type)
         except Exception as exc:
-            return ToolResult(success=False, output="", error=str(exc))
+            return ToolResult(success=False, output="", error=str(exc), error_type="git_command_failed")
+
+    def _is_inside_work_tree(self) -> bool:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(self._cwd),
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def _ensure_repo(self) -> "ToolResult | None":
+        """Return None if cwd is a git repo (or just init'd one); ToolResult on init failure."""
+        if self._is_inside_work_tree():
+            return None
+        try:
+            self._run(["git", "init"])
+            return None
+        except subprocess.CalledProcessError as exc:
+            return ToolResult(
+                success=False, output="",
+                error=f"Not a git repository and git init failed: {(exc.stderr or '').strip()}",
+                error_type="git_not_initialized",
+            )
 
     def _run(self, cmd: list[str]) -> str:
         result = subprocess.run(
