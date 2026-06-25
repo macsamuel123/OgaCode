@@ -109,18 +109,15 @@ class GitOpsTool(Tool):
         except Exception as exc:
             return ToolResult(success=False, output="", error=str(exc), error_type="git_command_failed")
 
-    def _is_inside_work_tree(self) -> bool:
-        result = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=str(self._cwd),
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0 and result.stdout.strip() == "true"
-
     def _ensure_repo(self) -> "ToolResult | None":
-        """Return None if cwd is a git repo (or just init'd one); ToolResult on init failure."""
-        if self._is_inside_work_tree():
+        """Return None if cwd is the ROOT of its own git repo (or was just init'd); ToolResult on failure.
+
+        Intentionally treats directories nested inside a parent repo
+        (e.g. extension/paystack-api/ inside the OgaCode repo) the same as
+        no-repo-at-all: runs git init so commits go to this project's own
+        history, not the parent's.
+        """
+        if self._is_repo_root():
             return None
         try:
             self._run(["git", "init"])
@@ -131,6 +128,21 @@ class GitOpsTool(Tool):
                 error=f"Not a git repository and git init failed: {(exc.stderr or '').strip()}",
                 error_type="git_not_initialized",
             )
+
+    def _is_repo_root(self) -> bool:
+        """True only if cwd is the root directory of a git repo — not merely nested inside one."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=str(self._cwd),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                return False
+            return Path(result.stdout.strip()).resolve() == Path(self._cwd).resolve()
+        except Exception:
+            return False
 
     def _run(self, cmd: list[str]) -> str:
         result = subprocess.run(
