@@ -44,8 +44,7 @@ app.add_middleware(_BodySizeLimit)
 app.add_middleware(GZipMiddleware, minimum_size=512)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://vscode.dev"],
-    allow_origin_regex=r"vscode-webview://.*|http://localhost:\d+",
+    allow_origins=["*"],
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -215,3 +214,81 @@ async def record_telemetry(request: Request) -> dict:
 @app.get("/telemetry/summary")
 async def telemetry_summary() -> dict:
     return dict(_telemetry)
+
+
+# ── Agent task execution (used by Lovable web frontend) ──────────────────────
+# Requires OGACODE_SERVER_URL + OGACODE_TOKEN env vars on Railway so the
+# agent can make LLM calls back through this server.
+
+from pydantic import BaseModel  # noqa: E402
+
+class TaskRequest(BaseModel):
+    task: str
+
+@app.post("/v1/task")
+async def run_task(req: TaskRequest, request: Request):
+    """
+    Accept a plain-text task, run the OgaCode agent, stream back SSE events.
+
+    Each event: data: {"type": "narrative"|"pre_tool"|"post_tool"|"stop", ...}
+    Final event: data: {"type": "stop", "success": true/false, "files": [...]}
+    """
+    _check_token(request.headers.get("authorization", ""))
+
+    async def event_stream():
+        import tempfile
+        from pathlib import Path
+
+        try:
+            from ogacode.agent.events import EventBus, NARRATIVE, PRE_TOOL, POST_TOOL, STOP
+            from ogacode.agent.loop import agent_loop
+        except ImportError as exc:
+            yield f'data: {json.dumps({"type": "error", "text": f"Agent not installed on server: {exc}"})}\n\n'
+            return
+
+        work_dir = Path(tempfile.mkdtemp(prefix="ogacode_task_"))
+        queue: asyncio.Queue[dict] = asyncio.Queue()
+        bus = EventBus()
+
+        def make_handler(ev_type: str):
+            def handler(ev: dict) -> None:
+                queue.put_nowait({"type": ev_type, **ev})
+            return handler
+
+        for ev_type in (NARRATIVE, PRE_TOOL, POST_TOOL, STOP):
+            bus.on(ev_type, make_handler(ev_type))
+
+        agent_task = asyncio.create_task(
+            agent_loop(req.task, cwd=work_dir, bus=bus)
+        )
+
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=0.2)
+                    yield f"data: {json.dumps(ev)}\n\n"
+                    if ev.get("type") == STOP:
+                        break
+                except asyncio.TimeoutError:
+                    if agent_task.done():
+                        # Drain any remaining events before closing
+                        while not queue.empty():
+                            ev = queue.get_nowait()
+                            yield f"data: {json.dumps(ev)}\n\n"
+                        break
+                    yield ": heartbeat\n\n"
+        except Exception as exc:
+            yield f'data: {json.dumps({"type": "error", "text": str(exc)})}\n\n'
+        finally:
+            if not agent_task.done():
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except asyncio.CancelledError:
+                    pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

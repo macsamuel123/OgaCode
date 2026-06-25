@@ -1,3 +1,10 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 httpx>=0.28.0
+# CLI agent dependencies (for /v1/task endpoint)
+click>=8.1
+rich>=13.0
+tiktoken>=0.7
+diskcache>=5.6
+keyring>=25.0
+python-dotenv>=1.0
